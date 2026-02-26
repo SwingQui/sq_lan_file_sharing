@@ -10,7 +10,6 @@ __pycache__/
 # PyInstaller
 build/
 dist/
-*.spec
 SQLanFileShare/
 
 # 运行时数据目录

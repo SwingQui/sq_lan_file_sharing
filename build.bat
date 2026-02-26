@@ -25,10 +25,10 @@ echo [3/3] 打包中...
 pyinstaller build.spec --clean
 
 echo.
-if exist "dist\LanFileShare.exe" (
+if exist "dist\SQLanFileShare.exe" (
     echo ========================================
     echo   打包成功！
-    echo   输出文件: dist\LanFileShare.exe
+    echo   输出文件: dist\SQLanFileShare.exe
     echo ========================================
 ) else (
     echo [错误] 打包失败，请检查错误信息
