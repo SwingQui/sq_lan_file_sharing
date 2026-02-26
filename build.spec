@@ -51,5 +51,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.png',  # 应用图标
+    icon='icon.ico',  # 应用图标
 )
