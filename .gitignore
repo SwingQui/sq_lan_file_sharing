@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# PyInstaller
+build/
+dist/
+*.spec
+SQLanFileShare/
+
+# 运行时数据目录
+data/
+Downloads/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 工具箱配置（非本项目内容）
+tool.json
