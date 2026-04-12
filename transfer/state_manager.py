@@ -1,9 +1,10 @@
-"""传输状态持久化模块"""
+"""传输状态持久化模块 - 优化版（内存缓存）"""
 import json
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Set, List
+from typing import Optional, Set, List, Dict
 from dataclasses import dataclass, field, asdict
 
 from config import LAN_SHARE_DIR, CHUNK_SIZE
@@ -56,7 +57,7 @@ class ReceivingState:
 
 
 class TransferStateManager:
-    """传输状态管理器"""
+    """传输状态管理器 - 使用内存缓存优化性能"""
 
     def __init__(self, data_dir: Path = None):
         self.data_dir = data_dir or LAN_SHARE_DIR
@@ -66,8 +67,13 @@ class TransferStateManager:
         self.sending_dir.mkdir(parents=True, exist_ok=True)
         self.receiving_dir.mkdir(parents=True, exist_ok=True)
 
+        # ===== 内存缓存（关键优化）=====
+        self._sending_cache: Dict[str, SendingState] = {}
+        self._receiving_cache: Dict[str, ReceivingState] = {}
+        self._cache_lock = threading.Lock()
+
+        # 同步控制
         self._last_sync_time: float = 0
-        self._pending_chunks: Set[int] = set()
         self._chunks_since_sync: int = 0
 
     def _atomic_write_json(self, filepath: Path, data: dict):
@@ -77,10 +83,13 @@ class TransferStateManager:
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             temp_file.replace(filepath)
-        except Exception:
+        except Exception as e:
             if temp_file.exists():
-                temp_file.unlink()
-            raise
+                try:
+                    temp_file.unlink()
+                except:
+                    pass
+            raise e
 
     def _read_json(self, filepath: Path) -> Optional[dict]:
         """读取 JSON 文件"""
@@ -88,8 +97,8 @@ class TransferStateManager:
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                pass
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"读取状态文件失败: {e}")
         return None
 
     # ==================== 发送状态管理 ====================
@@ -104,52 +113,66 @@ class TransferStateManager:
             file_hash=file_hash,
             receiver_device_id=receiver_device_id
         )
+        with self._cache_lock:
+            self._sending_cache[file_hash] = state
         self._save_sending_state(state)
         return state
 
     def _save_sending_state(self, state: SendingState):
-        """保存发送状态"""
+        """保存发送状态到磁盘"""
         state.updated_at = datetime.now().isoformat()
         filepath = self.sending_dir / f"{state.file_hash}.json"
         self._atomic_write_json(filepath, asdict(state))
 
     def load_sending_state(self, file_hash: str) -> Optional[SendingState]:
-        """加载发送状态"""
+        """加载发送状态（优先从缓存读取）"""
+        with self._cache_lock:
+            if file_hash in self._sending_cache:
+                return self._sending_cache[file_hash]
+
         filepath = self.sending_dir / f"{file_hash}.json"
         data = self._read_json(filepath)
         if data:
-            return SendingState(**data)
+            state = SendingState(**data)
+            with self._cache_lock:
+                self._sending_cache[file_hash] = state
+            return state
         return None
 
     def update_sent_chunks(self, file_hash: str, chunk_indices: List[int],
                            force_sync: bool = False, chunks_per_sync: int = 50,
                            sync_interval: float = 5.0):
-        """更新已发送块，按需持久化"""
-        state = self.load_sending_state(file_hash)
-        if not state:
-            return
+        """更新已发送块，按需持久化（使用内存缓存）"""
+        with self._cache_lock:
+            state = self._sending_cache.get(file_hash)
+            if not state:
+                # 缓存中没有，从磁盘加载
+                state = self.load_sending_state(file_hash)
+                if not state:
+                    return
 
-        # 添加新块
-        existing = set(state.sent_chunks)
-        for idx in chunk_indices:
-            if idx not in existing:
-                state.sent_chunks.append(idx)
+            # 添加新块（使用set去重）
+            existing = set(state.sent_chunks)
+            for idx in chunk_indices:
+                if idx not in existing:
+                    state.sent_chunks.append(idx)
+                    existing.add(idx)
 
-        self._chunks_since_sync += len(chunk_indices)
+            self._chunks_since_sync += len(chunk_indices)
 
-        # 判断是否需要同步
-        now = time.time()
-        should_sync = (
-            force_sync or
-            self._chunks_since_sync >= chunks_per_sync or
-            (now - self._last_sync_time) >= sync_interval
-        )
+            # 判断是否需要同步到磁盘
+            now = time.time()
+            should_sync = (
+                force_sync or
+                self._chunks_since_sync >= chunks_per_sync or
+                (now - self._last_sync_time) >= sync_interval
+            )
 
-        if should_sync:
-            state.sent_chunks = sorted(state.sent_chunks)
-            self._save_sending_state(state)
-            self._last_sync_time = now
-            self._chunks_since_sync = 0
+            if should_sync:
+                state.sent_chunks = sorted(state.sent_chunks)
+                self._save_sending_state(state)
+                self._last_sync_time = now
+                self._chunks_since_sync = 0
 
     def get_missing_chunks(self, file_hash: str) -> List[int]:
         """获取未发送的块索引"""
@@ -162,9 +185,15 @@ class TransferStateManager:
 
     def complete_sending(self, file_hash: str):
         """完成发送，清理状态"""
+        with self._cache_lock:
+            self._sending_cache.pop(file_hash, None)
+
         filepath = self.sending_dir / f"{file_hash}.json"
         if filepath.exists():
-            filepath.unlink()
+            try:
+                filepath.unlink()
+            except:
+                pass
 
     # ==================== 接收状态管理 ====================
 
@@ -179,52 +208,63 @@ class TransferStateManager:
             temp_file=temp_file,
             sender_device_id=sender_device_id
         )
+        with self._cache_lock:
+            self._receiving_cache[file_hash] = state
         self._save_receiving_state(state)
         return state
 
     def _save_receiving_state(self, state: ReceivingState):
-        """保存接收状态"""
+        """保存接收状态到磁盘"""
         state.updated_at = datetime.now().isoformat()
         filepath = self.receiving_dir / f"{state.file_hash}.json"
         self._atomic_write_json(filepath, asdict(state))
 
     def load_receiving_state(self, file_hash: str) -> Optional[ReceivingState]:
-        """加载接收状态"""
+        """加载接收状态（优先从缓存读取）"""
+        with self._cache_lock:
+            if file_hash in self._receiving_cache:
+                return self._receiving_cache[file_hash]
+
         filepath = self.receiving_dir / f"{file_hash}.json"
         data = self._read_json(filepath)
         if data:
-            return ReceivingState(**data)
+            state = ReceivingState(**data)
+            with self._cache_lock:
+                self._receiving_cache[file_hash] = state
+            return state
         return None
 
     def update_received_chunks(self, file_hash: str, chunk_indices: List[int],
                                force_sync: bool = False, chunks_per_sync: int = 50,
                                sync_interval: float = 5.0):
-        """更新已接收块，按需持久化"""
-        state = self.load_receiving_state(file_hash)
-        if not state:
-            return
+        """更新已接收块，按需持久化（使用内存缓存）"""
+        with self._cache_lock:
+            state = self._receiving_cache.get(file_hash)
+            if not state:
+                state = self.load_receiving_state(file_hash)
+                if not state:
+                    return
 
-        # 添加新块
-        existing = set(state.received_chunks)
-        for idx in chunk_indices:
-            if idx not in existing:
-                state.received_chunks.append(idx)
+            existing = set(state.received_chunks)
+            for idx in chunk_indices:
+                if idx not in existing:
+                    state.received_chunks.append(idx)
+                    existing.add(idx)
 
-        self._chunks_since_sync += len(chunk_indices)
+            self._chunks_since_sync += len(chunk_indices)
 
-        # 判断是否需要同步
-        now = time.time()
-        should_sync = (
-            force_sync or
-            self._chunks_since_sync >= chunks_per_sync or
-            (now - self._last_sync_time) >= sync_interval
-        )
+            now = time.time()
+            should_sync = (
+                force_sync or
+                self._chunks_since_sync >= chunks_per_sync or
+                (now - self._last_sync_time) >= sync_interval
+            )
 
-        if should_sync:
-            state.received_chunks = sorted(state.received_chunks)
-            self._save_receiving_state(state)
-            self._last_sync_time = now
-            self._chunks_since_sync = 0
+            if should_sync:
+                state.received_chunks = sorted(state.received_chunks)
+                self._save_receiving_state(state)
+                self._last_sync_time = now
+                self._chunks_since_sync = 0
 
     def get_missing_chunks_for_receive(self, file_hash: str) -> List[int]:
         """获取未接收的块索引"""
@@ -244,9 +284,15 @@ class TransferStateManager:
 
     def complete_receiving(self, file_hash: str):
         """完成接收，清理状态"""
+        with self._cache_lock:
+            self._receiving_cache.pop(file_hash, None)
+
         filepath = self.receiving_dir / f"{file_hash}.json"
         if filepath.exists():
-            filepath.unlink()
+            try:
+                filepath.unlink()
+            except:
+                pass
 
     def get_temp_file_path(self, file_hash: str) -> Path:
         """获取临时文件路径"""
@@ -275,7 +321,14 @@ class TransferStateManager:
     def cleanup_all(self):
         """清理所有状态文件（谨慎使用）"""
         import shutil
+        with self._cache_lock:
+            self._sending_cache.clear()
+            self._receiving_cache.clear()
+
         for d in [self.sending_dir, self.receiving_dir]:
             if d.exists():
-                shutil.rmtree(d)
-                d.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.rmtree(d)
+                    d.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    print(f"清理目录失败: {e}")

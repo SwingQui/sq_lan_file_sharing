@@ -3,7 +3,6 @@ import os
 import hashlib
 import shutil
 import zipfile
-import tempfile
 from pathlib import Path
 from typing import Optional, Callable, Tuple
 
@@ -73,7 +72,13 @@ class FileHandler:
     def _zip_folder(self, folder_path: str, zip_path: str):
         """将文件夹打包成zip"""
         folder = Path(folder_path)
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # 尝试使用 DEFLATED 压缩，如果不可用则使用 STORED
+        try:
+            compression = zipfile.ZIP_DEFLATED
+        except:
+            compression = zipfile.ZIP_STORED
+
+        with zipfile.ZipFile(zip_path, 'w', compression) as zipf:
             for file in folder.rglob('*'):
                 if file.is_file():
                     arcname = file.relative_to(folder)
@@ -90,8 +95,8 @@ class FileHandler:
         """清理临时文件"""
         try:
             Path(filepath).unlink(missing_ok=True)
-        except:
-            pass
+        except Exception as e:
+            print(f"清理临时文件失败: {e}")
 
     def save_file(self, filename: str, data: bytes, is_folder: bool = False) -> str:
         """
@@ -117,13 +122,15 @@ class FileHandler:
             unique_folder = self.get_unique_filename(self.download_dir, folder_name)
             extract_path = self.download_dir / unique_folder
 
-            with zipfile.ZipFile(filepath, 'r') as zipf:
-                zipf.extractall(extract_path)
-
-            # 删除临时zip文件
-            filepath.unlink()
-
-            return str(extract_path)
+            try:
+                with zipfile.ZipFile(filepath, 'r') as zipf:
+                    zipf.extractall(extract_path)
+                # 删除临时zip文件
+                filepath.unlink()
+                return str(extract_path)
+            except Exception as e:
+                print(f"解压文件夹失败: {e}")
+                return str(filepath)
 
         return str(filepath)
 
@@ -141,7 +148,7 @@ class FileSender:
         self.temp_zip_path: Optional[str] = None
 
         # 回调
-        self.on_progress: Optional[Callable[[int, int], None]] = None  # (current, total)
+        self.on_progress: Optional[Callable[[int, int], None]] = None
         self.on_complete: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
 
@@ -192,7 +199,10 @@ class FileSender:
     def complete(self):
         """发送完成，清理资源"""
         if self.current_file_handle:
-            self.current_file_handle.close()
+            try:
+                self.current_file_handle.close()
+            except:
+                pass
             self.current_file_handle = None
 
         if self.temp_zip_path:
@@ -208,58 +218,3 @@ class FileSender:
     def cancel(self):
         """取消发送"""
         self.complete()
-
-
-class FileReceiver:
-    """文件接收器"""
-
-    def __init__(self, file_handler: FileHandler):
-        self.file_handler = file_handler
-        self.temp_data: bytearray = bytearray()
-        self.current_filename: Optional[str] = None
-        self.expected_size: int = 0
-        self.is_folder: bool = False
-
-        # 回调
-        self.on_progress: Optional[Callable[[int, int], None]] = None
-        self.on_complete: Optional[Callable[[str], None]] = None
-        self.on_error: Optional[Callable[[str], None]] = None
-
-    def start_receive(self, filename: str, filesize: int, is_folder: bool = False):
-        """开始接收文件"""
-        self.current_filename = filename
-        self.expected_size = filesize
-        self.is_folder = is_folder
-        self.temp_data = bytearray()
-
-    def receive_chunk(self, data: bytes):
-        """接收数据块"""
-        self.temp_data.extend(data)
-
-        if self.on_progress:
-            self.on_progress(len(self.temp_data), self.expected_size)
-
-    def complete_receive(self) -> str:
-        """完成接收，保存文件"""
-        if not self.current_filename:
-            raise ValueError("没有正在接收的文件")
-
-        saved_path = self.file_handler.save_file(
-            self.current_filename,
-            bytes(self.temp_data),
-            self.is_folder
-        )
-
-        result_path = saved_path
-        self.temp_data = bytearray()
-        self.current_filename = None
-
-        if self.on_complete:
-            self.on_complete(result_path)
-
-        return result_path
-
-    def cancel(self):
-        """取消接收"""
-        self.temp_data = bytearray()
-        self.current_filename = None

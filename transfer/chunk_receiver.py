@@ -1,25 +1,43 @@
-"""内存安全的分块文件接收器"""
+"""内存安全的分块文件接收器 - 支持批量确认"""
 import os
+import threading
+import time
 from pathlib import Path
-from typing import Optional, Callable, Set
+from typing import Optional, Callable, Set, List
 
-from config import LAN_SHARE_DIR, CHUNK_SIZE
+from config import LAN_SHARE_DIR, CHUNK_SIZE, ACK_BATCH_SIZE
 from transfer.state_manager import TransferStateManager, ReceivingState
+from file_handler import FileHandler
 
 
 class ChunkedFileReceiver:
-    """分块文件接收器 - 内存安全，边接收边写入磁盘"""
+    """分块文件接收器 - 内存安全，边接收边写入磁盘，支持批量确认"""
 
     def __init__(self, state_manager: TransferStateManager = None,
                  download_dir: Path = None,
-                 on_progress: Callable[[int, int], None] = None):
+                 on_progress: Callable[[int, int], None] = None,
+                 on_send_ack: Callable[[list], None] = None):
+        """
+        Args:
+            state_manager: 状态管理器
+            download_dir: 下载目录
+            on_progress: 进度回调 (已接收块数, 总块数)
+            on_send_ack: 发送确认回调 (已接收块索引列表)
+        """
         self.state_manager = state_manager or TransferStateManager()
         self.download_dir = download_dir or LAN_SHARE_DIR.parent
         self.on_progress = on_progress
+        self.on_send_ack = on_send_ack
 
         self.current_state: Optional[ReceivingState] = None
         self.file_handle = None
         self._received_set: Set[int] = set()
+
+        # 批量确认缓冲
+        self._pending_acks: List[int] = []
+        self._ack_lock = threading.Lock()
+        self._last_ack_time: float = 0
+        self._ack_interval: float = 0.1  # 100ms 发送一次批量确认
 
     def start_receive(self, file_name: str, file_size: int, file_hash: str,
                       sender_device_id: str = '', chunk_size: int = CHUNK_SIZE) -> bool:
@@ -67,6 +85,10 @@ class ChunkedFileReceiver:
         # 打开文件用于随机写入
         self.file_handle = open(temp_path, 'r+b')
 
+        # 清空待确认列表
+        self._pending_acks.clear()
+        self._last_ack_time = time.time()
+
         return True
 
     def write_chunk(self, chunk_index: int, data: bytes) -> bool:
@@ -83,7 +105,8 @@ class ChunkedFileReceiver:
 
         # 检查是否已接收
         if chunk_index in self._received_set:
-            return True  # 已接收，跳过
+            # 已接收，不重复发送ACK（减少网络开销）
+            return True
 
         try:
             # 计算写入位置
@@ -93,14 +116,14 @@ class ChunkedFileReceiver:
             self.file_handle.seek(offset)
             self.file_handle.write(data)
 
+            # 不在每块写入后fsync，这会严重影响性能
+            # 数据会由操作系统缓存，传输完成后再fsync
+
             # 记录已接收
             self._received_set.add(chunk_index)
 
-            # 更新状态
-            self.state_manager.update_received_chunks(
-                self.current_state.file_hash,
-                [chunk_index]
-            )
+            # 添加到待确认列表
+            self._add_pending_ack(chunk_index)
 
             # 回调进度
             if self.on_progress:
@@ -113,6 +136,41 @@ class ChunkedFileReceiver:
         except Exception as e:
             print(f"写入块 {chunk_index} 失败: {e}")
             return False
+
+    def _add_pending_ack(self, chunk_index: int):
+        """添加待发送的确认"""
+        with self._ack_lock:
+            self._pending_acks.append(chunk_index)
+
+            # 检查是否需要发送确认
+            should_send = (
+                len(self._pending_acks) >= ACK_BATCH_SIZE or
+                (time.time() - self._last_ack_time) >= self._ack_interval
+            )
+
+            if should_send and self.on_send_ack:
+                acks = self._pending_acks.copy()
+                self._pending_acks.clear()
+                self._last_ack_time = time.time()
+                # 在锁外调用回调，避免死锁
+                self._send_acks_async(acks)
+
+    def _send_acks_async(self, acks: list):
+        """异步发送确认"""
+        if self.on_send_ack:
+            try:
+                self.on_send_ack(acks)
+            except Exception as e:
+                print(f"发送确认失败: {e}")
+
+    def flush_acks(self):
+        """强制发送所有待发送的确认"""
+        with self._ack_lock:
+            if self._pending_acks and self.on_send_ack:
+                acks = self._pending_acks.copy()
+                self._pending_acks.clear()
+                self._last_ack_time = time.time()
+                self._send_acks_async(acks)
 
     def get_missing_chunks(self) -> list:
         """获取未接收的块索引列表"""
@@ -144,8 +202,16 @@ class ChunkedFileReceiver:
         if not self.current_state:
             return None
 
-        # 关闭文件句柄
+        # 发送最后的确认
+        self.flush_acks()
+
+        # 确保所有数据写入磁盘后再关闭
         if self.file_handle:
+            try:
+                self.file_handle.flush()
+                os.fsync(self.file_handle.fileno())
+            except:
+                pass
             self.file_handle.close()
             self.file_handle = None
 
@@ -157,6 +223,21 @@ class ChunkedFileReceiver:
         try:
             # 获取临时文件路径
             temp_path = self.state_manager.get_temp_file_path(self.current_state.file_hash)
+
+            # ===== 哈希验证（无损传输关键） =====
+            expected_hash = self.current_state.file_hash
+            actual_hash = FileHandler.get_file_hash(str(temp_path))
+
+            if actual_hash != expected_hash:
+                print(f"文件哈希不匹配！预期: {expected_hash}, 实际: {actual_hash}")
+                # 删除损坏的文件
+                temp_path.unlink(missing_ok=True)
+                self.state_manager.complete_receiving(self.current_state.file_hash)
+                self.current_state = None
+                self._received_set.clear()
+                return None
+
+            print(f"文件哈希验证通过: {actual_hash[:16]}...")
 
             # 目标路径
             final_path = self.download_dir / self.current_state.file_name
@@ -188,6 +269,9 @@ class ChunkedFileReceiver:
 
     def cancel(self):
         """取消接收"""
+        # 发送最后的确认
+        self.flush_acks()
+
         if self.file_handle:
             self.file_handle.close()
             self.file_handle = None

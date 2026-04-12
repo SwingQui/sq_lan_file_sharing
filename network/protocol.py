@@ -23,6 +23,7 @@ class MessageType(IntEnum):
     FILE_COMPLETE = 14    # 传输完成确认
     HEARTBEAT = 15        # 心跳包
     RECONNECT = 16        # 重连请求（信任设备）
+    DATA_ACK = 17         # 数据块确认（滑动窗口用）
 
 
 class Protocol:
@@ -193,4 +194,18 @@ class MessageBuilder:
         return Protocol.encode(MessageType.RECONNECT, {
             'device_id': device_id,
             'hostname': hostname
+        })
+
+    @staticmethod
+    def data_ack(chunk_index: int) -> bytes:
+        """构建数据块确认消息（滑动窗口用）"""
+        return Protocol.encode(MessageType.DATA_ACK, {
+            'chunk_index': chunk_index
+        })
+
+    @staticmethod
+    def data_ack_batch(chunk_indices: list) -> bytes:
+        """构建批量数据块确认消息"""
+        return Protocol.encode(MessageType.DATA_ACK, {
+            'chunk_indices': chunk_indices
         })

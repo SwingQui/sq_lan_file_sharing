@@ -1,847 +1,1330 @@
-"""主窗口模块"""
-import sys
+"""主窗口模块 - 卡片式布局"""
+import os
+import math
+import socket
 import threading
 import time
+import random
+import string
+import platform
+import struct
 from pathlib import Path
 from typing import Optional, List
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit,
-    QGroupBox, QProgressBar, QFileDialog,
-    QMessageBox, QApplication
+    QFileDialog, QMessageBox, QApplication,
+    QFrame, QDesktopWidget, QGridLayout,
+    QProgressBar, QSplitter, QSizePolicy
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QMimeData
 from PyQt5.QtGui import QFont, QDragEnterEvent, QDropEvent, QCursor, QMouseEvent
 
 from network.server import LanShareServer
 from network.client import LanShareClient
-from network.protocol import MessageBuilder, MessageType
+from network.protocol import Protocol, MessageType, MessageBuilder
+from network.discovery import RoomBroadcaster, RoomScanner, RoomInfo
 from file_handler import FileHandler
 from transfer.chunk_receiver import ChunkedFileReceiver
 from transfer.chunk_sender import ChunkedFileSender
 from transfer.state_manager import TransferStateManager
 from config import (
-    DEFAULT_DOWNLOAD_DIR, BUFFER_SIZE, CHUNK_SIZE,
+    DEFAULT_DOWNLOAD_DIR, CHUNK_SIZE, DEFAULT_PORT, MAX_CONCURRENT_FILES,
     get_last_file_dir, set_last_file_dir,
     get_last_folder_dir, set_last_folder_dir
 )
 
 
+# ==================== 主题颜色 ====================
+THEME = {
+    'primary': '#2D8C6F',
+    'primary_hover': '#236B55',
+    'primary_active': '#1A5040',
+    'primary_light': '#D1FAE5',
+    'bg': '#F5FAF8',
+    'card_bg': '#FFFFFF',
+    'text': '#374151',
+    'text_secondary': '#6B7280',
+    'border': '#E5E7EB',
+    'success': '#2D8C6F',
+    'warning': '#D97706',
+    'error': '#DC2626',
+}
+
+
 class ClickableLabel(QLabel):
     """可点击的标签，点击复制内容到剪贴板"""
 
-    def __init__(self, text="", parent=None, color="#4CAF50"):
+    def __init__(self, text="", parent=None, color=THEME['primary']):
         super().__init__(text, parent)
         self.original_color = color
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setToolTip("点击复制")
-        self.setStyleSheet(f"color: {color};")
+        self.setStyleSheet(f"color: {color}; font-weight: bold;")
 
     def mousePressEvent(self, event: QMouseEvent):
-        """鼠标点击事件"""
         if event.button() == Qt.LeftButton:
             text = self.text()
-            if text:
+            if text and text != '-':
                 clipboard = QApplication.clipboard()
                 clipboard.setText(text)
                 self.setToolTip("已复制!")
-                self.setStyleSheet("color: #FF9800;")
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(500, self._reset_style)
+                self.setStyleSheet(f"color: {THEME['warning']}; font-weight: bold;")
+                QTimer.singleShot(1000, self._reset_style)
 
     def _reset_style(self):
-        """恢复样式"""
-        self.setStyleSheet(f"color: {self.original_color};")
+        self.setStyleSheet(f"color: {self.original_color}; font-weight: bold;")
         self.setToolTip("点击复制")
 
 
 class WorkerSignals(QObject):
-    """工作线程信号"""
-    error = pyqtSignal(str)
-    connected = pyqtSignal(str)
-    disconnected = pyqtSignal()
-    file_info = pyqtSignal(dict)
-    file_progress = pyqtSignal(int, int)
-    file_complete = pyqtSignal(str)
+    """工作线程信号 - 所有跨线程UI通信必须通过信号"""
     log = pyqtSignal(str)
-    reconnect_status = pyqtSignal(str)
+    status_changed = pyqtSignal(str, str)        # status_text, color
+    peer_changed = pyqtSignal(str)               # peer_name
+    connected = pyqtSignal(str)                  # peer_name
+    disconnected = pyqtSignal()
+    send_progress = pyqtSignal(int, str, str, str)  # percent, filename, transferred, total
+    send_total_progress = pyqtSignal(int, int, int, str, str)  # done, current, total, transferred, total_size
+    send_completed = pyqtSignal(bool, str)       # success, message
+    recv_progress = pyqtSignal(int, str, str)    # percent, received, total
+    recv_file_info = pyqtSignal(str, int)        # filename, size
+    recv_completed = pyqtSignal(bool, str)       # success, message
+    room_found = pyqtSignal(str, str, str)       # name, ip, pair_code
+    room_expired = pyqtSignal(str)               # ip
 
 
-class FileTransferManager:
-    """文件传输管理器 - 使用分块传输"""
+class CardWidget(QFrame):
+    """卡片组件"""
 
-    def __init__(self, file_handler: FileHandler, signals: WorkerSignals, send_func):
-        self.file_handler = file_handler
-        self.signals = signals
-        self.send = send_func
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background-color: {THEME['card_bg']};
+                border-radius: 12px;
+                border: none;
+            }}
+        """)
+        self._init_ui(title)
 
-        # 状态管理器
-        self.state_manager = TransferStateManager()
+    def _init_ui(self, title: str):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
 
-        # 发送状态
-        self.is_sending = False
-        self.sender: Optional[ChunkedFileSender] = None
-        self.send_thread: Optional[threading.Thread] = None
+        title_label = QLabel(title)
+        title_label.setStyleSheet(f"""
+            font-size: 16px;
+            font-weight: bold;
+            color: {THEME['text']};
+        """)
+        title_label.setAlignment(Qt.AlignLeft)
+        main_layout.addWidget(title_label)
 
-        # 接收状态
-        self.is_receiving = False
-        self.receiver: Optional[ChunkedFileReceiver] = None
-        self.receive_filesize: int = 0
-        self.receive_file_hash: str = ''
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(8)
+        main_layout.addWidget(self.content_widget, 1)
 
-    # ==================== 发送 ====================
+        main_layout.addStretch()
 
-    def start_send(self, filepath: str, peer_device_id: str = '', on_complete_callback=None):
-        """开始发送文件"""
-        if self.is_sending:
-            return False
+    def add_widget(self, widget: QWidget, stretch: int = 0):
+        self.content_layout.addWidget(widget, stretch)
 
-        self.is_sending = True
-        self.on_complete_callback = on_complete_callback
-
-        self.send_thread = threading.Thread(
-            target=self._send_file_task,
-            args=(filepath, peer_device_id),
-            daemon=True
-        )
-        self.send_thread.start()
-        return True
-
-    def _send_file_task(self, filepath: str, peer_device_id: str):
-        """发送文件任务"""
-        try:
-            # 创建发送器
-            self.sender = ChunkedFileSender(
-                state_manager=self.state_manager,
-                on_progress=self._on_send_progress,
-                on_chunk_sent=self._send_chunk
-            )
-
-            # 准备文件
-            filename, filesize, file_hash, is_folder = self.sender.prepare(filepath, peer_device_id)
-
-            self.signals.log.emit(f"发送: {filename} ({filesize} 字节)")
-
-            # 发送文件信息
-            self.send(MessageBuilder.file_info(filename, filesize, file_hash, is_folder))
-
-            # 发送所有块
-            retry_count = 0
-            max_retry = 3
-
-            while not self.sender.is_complete() and retry_count < max_retry:
-                chunk = self.sender.get_next_chunk()
-                if chunk is None:
-                    break
-
-                chunk_index, data = chunk
-                if not self._send_chunk_with_data(chunk_index, data):
-                    retry_count += 1
-                    continue
-
-                retry_count = 0  # 重置重试计数
-
-            if self.sender.is_complete():
-                self.signals.log.emit(f"发送完成: {filename}")
-            else:
-                self.signals.error.emit(f"发送失败: {filename}")
-
-        except Exception as e:
-            self.signals.error.emit(f"发送失败: {str(e)}")
-        finally:
-            if self.sender:
-                self.sender.complete()
-                self.sender = None
-            self.is_sending = False
-            if self.on_complete_callback:
-                self.on_complete_callback()
-
-    def _send_chunk(self, chunk_index: int, data: bytes) -> bool:
-        """发送块回调"""
-        return self._send_chunk_with_data(chunk_index, data)
-
-    def _send_chunk_with_data(self, chunk_index: int, data: bytes) -> bool:
-        """发送数据块"""
-        try:
-            msg = MessageBuilder.file_data(chunk_index, data)
-            if self.send(msg):
-                if self.sender:
-                    self.sender.mark_chunk_sent(chunk_index)
-                return True
-        except Exception as e:
-            print(f"发送块 {chunk_index} 失败: {e}")
-        return False
-
-    def _on_send_progress(self, sent: int, total: int):
-        """发送进度回调"""
-        self.signals.file_progress.emit(sent, total)
-
-    def resume_send(self, received_chunks: list):
-        """根据接收方的已接收列表恢复发送"""
-        if self.sender:
-            self.sender.resume_from_chunks(received_chunks)
-            self.signals.log.emit(f"续传: 从块 {len(received_chunks)} 继续")
-
-    # ==================== 接收 ====================
-
-    def start_receive(self, info: dict):
-        """开始接收文件"""
-        if self.is_receiving:
-            return
-
-        self.is_receiving = True
-        self.receive_filesize = info.get('filesize', 0)
-        self.receive_file_hash = info.get('hash', '')
-
-        filename = info.get('filename', 'unknown')
-        is_folder = info.get('is_folder', False)
-
-        # 检查是否有未完成的接收
-        existing_state = self.state_manager.load_receiving_state(self.receive_file_hash)
-
-        # 创建接收器
-        self.receiver = ChunkedFileReceiver(
-            state_manager=self.state_manager,
-            download_dir=Path(self.file_handler.download_dir),
-            on_progress=self._on_receive_progress
-        )
-
-        # 开始接收
-        self.receiver.start_receive(
-            file_name=filename,
-            file_size=self.receive_filesize,
-            file_hash=self.receive_file_hash,
-            chunk_size=CHUNK_SIZE
-        )
-
-        if existing_state:
-            # 有历史状态，发送续传请求
-            self.signals.log.emit(f"续传接收: {filename} (已接收 {len(existing_state.received_chunks)} 块)")
-            # 注意：续传请求需要通过UI层发送，因为需要访问send函数
-            self._pending_resume = existing_state.received_chunks
-        else:
-            self.signals.log.emit(f"接收: {filename} ({self.receive_filesize} 字节)")
-            self._pending_resume = None
-
-    def get_pending_resume_chunks(self) -> Optional[list]:
-        """获取待发送的续传块列表"""
-        chunks = self._pending_resume
-        self._pending_resume = None
-        return chunks
-
-    def receive_data(self, chunk_index: int, data: bytes):
-        """接收文件数据"""
-        if not self.is_receiving or not self.receiver:
-            return
-
-        # 写入块
-        self.receiver.write_chunk(chunk_index, data)
-
-        # 检查是否完成
-        if self.receiver.is_complete():
-            self._complete_receive()
-
-    def _on_receive_progress(self, received: int, total: int):
-        """接收进度回调"""
-        self.signals.file_progress.emit(received, total)
-
-    def _complete_receive(self):
-        """完成接收"""
-        if not self.receiver:
-            return
-
-        try:
-            saved_path = self.receiver.complete()
-            if saved_path:
-                self.signals.log.emit(f"已保存: {saved_path}")
-                self.signals.file_complete.emit(saved_path)
-        except Exception as e:
-            self.signals.error.emit(f"保存文件失败: {str(e)}")
-        finally:
-            self.is_receiving = False
-            self.receiver = None
-
-    def cancel(self):
-        """取消传输"""
-        self.is_sending = False
-        self.is_receiving = False
-
-        if self.sender:
-            self.sender.cancel()
-            self.sender = None
-
-        if self.receiver:
-            self.receiver.cancel()
-            self.receiver = None
+    def add_layout(self, layout):
+        self.content_layout.addLayout(layout)
 
 
 class MainWindow(QMainWindow):
-    """主窗口"""
+    """主窗口 - 卡片式双列布局"""
 
     def __init__(self):
         super().__init__()
-
-        self.server: Optional[LanShareServer] = None
-        self.client: Optional[LanShareClient] = None
-        self.is_server_mode = False
-        self.download_dir = DEFAULT_DOWNLOAD_DIR
-        self.file_handler = FileHandler(self.download_dir)
-        self.transfer_manager: Optional[FileTransferManager] = None
-
-        self.pending_files: List[str] = []
-
-        self.signals = WorkerSignals()
-        self._setup_signals()
-        self._init_ui()
-
-    def _setup_signals(self):
-        """设置信号连接"""
-        self.signals.error.connect(self._show_error)
-        self.signals.connected.connect(self._on_connected)
-        self.signals.disconnected.connect(self._on_disconnected)
-        self.signals.file_progress.connect(self._on_progress)
-        self.signals.file_complete.connect(self._on_file_complete)
-        self.signals.log.connect(self._log)
-        self.signals.reconnect_status.connect(self._on_reconnect_status)
-
-    def _init_ui(self):
-        """初始化UI"""
-        self.setWindowTitle("局域网文件共享")
-        self.setMinimumSize(600, 550)
+        self._local_ip = "-"
+        self._connection_status = "未连接"
+        self._peer_name = "-"
+        self._download_dir = DEFAULT_DOWNLOAD_DIR
+        self._server = None
+        self._client = None
+        self._broadcaster = None
+        self._scanner = None
+        self._files_to_send = []
+        self._file_handler = FileHandler(self._download_dir)
+        self._chunk_receiver = None
+        self._current_sender = None
+        self._transfer_state_manager = TransferStateManager()
+        self._sending = False
+        self._signals = WorkerSignals()
+        self._setup_ui()
+        self._connect_signals()
+        self._get_local_ip()
         self.setAcceptDrops(True)
+
+    # ==================== UI 构建 ====================
+
+    def _setup_ui(self):
+        self.setWindowTitle("SQ 局域网文件共享")
+        self.setMinimumSize(900, 650)
+        self.resize(1000, 700)
+        self._center_window()
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-color: {THEME['bg']};
+            }}
+            QPushButton {{
+                background-color: {THEME['primary']};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 20px;
+                font-size: 14px;
+            }}
+            QPushButton:hover {{
+                background-color: {THEME['primary_hover']};
+            }}
+            QPushButton:pressed {{
+                background-color: {THEME['primary_active']};
+            }}
+            QPushButton:disabled {{
+                background-color: {THEME['border']};
+                color: {THEME['text_secondary']};
+            }}
+            QLineEdit, QTextEdit {{
+                border: 1px solid {THEME['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                background-color: white;
+            }}
+            QLineEdit:focus, QTextEdit:focus {{
+                border: 2px solid {THEME['primary']};
+            }}
+            QProgressBar {{
+                border-radius: 8px;
+                text-align: center;
+                background-color: {THEME['border']};
+                min-height: 20px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {THEME['primary']};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {THEME['text']};
+            }}
+        """)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
 
-        self._create_ip_section(main_layout)
-        self._create_connection_section(main_layout)
-        self._create_status_section(main_layout)
-        self._create_transfer_section(main_layout)
-        self._create_log_section(main_layout)
+        # 顶部状态栏
+        main_layout.addWidget(self._create_status_bar())
 
-    def _create_ip_section(self, layout: QVBoxLayout):
-        """创建IP显示区域"""
-        group = QGroupBox("本机信息")
-        group_layout = QHBoxLayout(group)
+        # 中间内容区 - 使用 QGridLayout 双列
+        content_widget = QWidget()
+        content_layout = QGridLayout(content_widget)
+        content_layout.setSpacing(12)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setColumnStretch(0, 1)
+        content_layout.setColumnStretch(1, 1)
+        content_layout.setRowStretch(0, 1)
 
-        ip_label = QLabel("本机 IP:")
-        ip_label.setFont(QFont("Microsoft YaHei", 10))
+        # 左侧: 连接卡片
+        self.connection_card = self._create_connection_card()
+        self.connection_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        content_layout.addWidget(self.connection_card, 0, 0)
 
-        self.ip_display = ClickableLabel(color="#2196F3")
-        self.ip_display.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        # 右侧: 传输卡片
+        self.transfer_card = self._create_transfer_card()
+        self.transfer_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        content_layout.addWidget(self.transfer_card, 0, 1)
 
-        local_ip = LanShareServer.get_local_ip()
-        self.ip_display.setText(local_ip)
+        main_layout.addWidget(content_widget, 1)
 
-        group_layout.addWidget(ip_label)
-        group_layout.addWidget(self.ip_display)
-        group_layout.addStretch()
+        # 底部: 日志卡片
+        self.log_card = self._create_log_card()
+        main_layout.addWidget(self.log_card)
 
-        layout.addWidget(group)
+    def _create_status_bar(self) -> QWidget:
+        widget = QWidget()
+        widget.setStyleSheet(f"""
+            QWidget {{
+                background-color: {THEME['card_bg']};
+                border-radius: 8px;
+            }}
+        """)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(16, 12, 16, 12)
 
-    def _create_connection_section(self, layout: QVBoxLayout):
-        """创建连接区域"""
-        group = QGroupBox("连接设置")
-        group_layout = QVBoxLayout(group)
+        ip_label = QLabel("本机IP:")
+        ip_label.setStyleSheet(f"color: {THEME['text_secondary']}; font-weight: 600;")
+        self.ip_value = ClickableLabel("-", color=THEME['primary'])
+        layout.addWidget(ip_label)
+        layout.addWidget(self.ip_value)
+        layout.addSpacing(40)
 
-        mode_layout = QHBoxLayout()
+        status_label = QLabel("状态:")
+        status_label.setStyleSheet(f"color: {THEME['text_secondary']}; font-weight: 600;")
+        self.status_value = QLabel("未连接")
+        self.status_value.setStyleSheet(f"color: {THEME['text_secondary']}; font-weight: bold;")
+        layout.addWidget(status_label)
+        layout.addWidget(self.status_value)
+        layout.addSpacing(40)
 
-        self.server_btn = QPushButton("创建房间 (生成配对码)")
-        self.server_btn.setMinimumHeight(40)
-        self.server_btn.clicked.connect(self._start_server)
+        peer_label = QLabel("对方:")
+        peer_label.setStyleSheet(f"color: {THEME['text_secondary']}; font-weight: 600;")
+        self.peer_value = QLabel("-")
+        self.peer_value.setStyleSheet(f"color: {THEME['primary']}; font-weight: bold;")
+        layout.addWidget(peer_label)
+        layout.addWidget(self.peer_value)
 
-        self.client_btn = QPushButton("加入房间 (输入配对码)")
-        self.client_btn.setMinimumHeight(40)
-        self.client_btn.clicked.connect(self._show_client_input)
+        layout.addStretch()
+        return widget
 
-        mode_layout.addWidget(self.server_btn)
-        mode_layout.addWidget(self.client_btn)
-        group_layout.addLayout(mode_layout)
+    def _create_connection_card(self) -> CardWidget:
+        card = CardWidget("连接", self)
 
-        code_layout = QHBoxLayout()
+        # 按钮垂直排布，撑满容器
+        btn_container = QWidget()
+        btn_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        btn_layout = QVBoxLayout(btn_container)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(16)
+
+        self.btn_create = QPushButton("创建房间")
+        self.btn_create.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.btn_create.setStyleSheet("font-size: 20px;")
+        self.btn_create.clicked.connect(self._on_create_room)
+        btn_layout.addWidget(self.btn_create, 1)
+
+        self.btn_join = QPushButton("加入房间")
+        self.btn_join.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.btn_join.setStyleSheet("font-size: 20px;")
+        self.btn_join.clicked.connect(self._on_join_room)
+        btn_layout.addWidget(self.btn_join, 1)
+
+        card.add_widget(btn_container)
+
+        # 等待连接模式
+        self.waiting_widget = QWidget()
+        self.waiting_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        waiting_layout = QVBoxLayout(self.waiting_widget)
+        waiting_layout.setContentsMargins(0, 8, 0, 0)
+
+        waiting_layout.addStretch()
+
+        pair_layout = QHBoxLayout()
+        pair_layout.addStretch()
+        pair_label = QLabel("配对码:")
+        pair_label.setStyleSheet(f"color: {THEME['text_secondary']};")
+        self.pair_code_label = ClickableLabel("------", color=THEME['primary'])
+        font = self.pair_code_label.font()
+        font.setPointSize(20)
+        font.setBold(True)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 4)
+        self.pair_code_label.setFont(font)
+        pair_layout.addWidget(pair_label)
+        pair_layout.addWidget(self.pair_code_label)
+        pair_layout.addStretch()
+        waiting_layout.addLayout(pair_layout)
+
+        tip_label = QLabel("请将配对码告知对方，或等待对方自动发现")
+        tip_label.setStyleSheet(f"color: {THEME['text_secondary']}; font-size: 12px;")
+        tip_label.setAlignment(Qt.AlignCenter)
+        waiting_layout.addWidget(tip_label)
+
+        self.btn_cancel_wait = self._create_outline_button("取消")
+        self.btn_cancel_wait.clicked.connect(self._on_cancel_wait)
+        waiting_layout.addWidget(self.btn_cancel_wait, alignment=Qt.AlignCenter)
+
+        waiting_layout.addStretch()
+
+        self.waiting_widget.hide()
+        card.add_widget(self.waiting_widget, 1)
+
+        # 房间列表
+        self.room_list_widget = QWidget()
+        self.room_list_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        room_layout = QVBoxLayout(self.room_list_widget)
+        room_layout.setContentsMargins(0, 8, 0, 0)
+
+        room_title = QLabel("局域网房间 (双击连接)")
+        room_title.setStyleSheet(f"color: {THEME['text_secondary']}; font-weight: 600; font-size: 13px;")
+        room_layout.addWidget(room_title)
+
+        self.room_list = QTextEdit()
+        self.room_list.setReadOnly(True)
+        self.room_list.setMaximumHeight(120)
+        self.room_list.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {THEME['bg']};
+                border-radius: 8px;
+            }}
+        """)
+        self.room_list.hide()
+        room_layout.addWidget(self.room_list)
+
+        # 房间按钮容器
+        self.room_buttons_widget = QWidget()
+        self.room_buttons_layout = QVBoxLayout(self.room_buttons_widget)
+        self.room_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        self.room_buttons_layout.setSpacing(8)
+        # 存储房间按钮 {ip: QPushButton}
+        self._room_buttons = {}
+        room_layout.addWidget(self.room_buttons_widget)
+
+        self.btn_cancel_discovery = self._create_outline_button("取消扫描")
+        self.btn_cancel_discovery.clicked.connect(self._on_cancel_discovery)
+        room_layout.addWidget(self.btn_cancel_discovery)
+
+        self.room_list_widget.hide()
+        card.add_widget(self.room_list_widget, 1)
+
+        # 手动连接
+        self.manual_widget = QWidget()
+        self.manual_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        manual_layout = QVBoxLayout(self.manual_widget)
+        manual_layout.setContentsMargins(0, 8, 0, 0)
+
+        manual_layout.addStretch()
+        manual_layout.setSpacing(8)
+
+        manual_title = QLabel("手动连接")
+        manual_title.setStyleSheet(f"color: {THEME['text_secondary']}; font-weight: 600; font-size: 13px;")
+        manual_layout.addWidget(manual_title)
+
+        input_layout = QHBoxLayout()
+        input_layout.setSpacing(12)
+
+        ip_label = QLabel("IP:")
+        ip_label.setStyleSheet(f"color: {THEME['text_secondary']};")
+        self.input_ip = QLineEdit()
+        self.input_ip.setPlaceholderText("192.168.1.100")
+        self.input_ip.setFixedWidth(140)
+        input_layout.addWidget(ip_label)
+        input_layout.addWidget(self.input_ip)
 
         code_label = QLabel("配对码:")
-        code_label.setFont(QFont("Microsoft YaHei", 10))
+        code_label.setStyleSheet(f"color: {THEME['text_secondary']};")
+        self.input_code = QLineEdit()
+        self.input_code.setPlaceholderText("6位数字")
+        self.input_code.setMaxLength(6)
+        self.input_code.setFixedWidth(100)
+        input_layout.addWidget(code_label)
+        input_layout.addWidget(self.input_code)
 
-        self.pair_code_display = ClickableLabel(color="#4CAF50")
-        self.pair_code_display.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
+        self.btn_connect = QPushButton("连接")
+        self.btn_connect.clicked.connect(self._on_manual_connect)
+        input_layout.addWidget(self.btn_connect)
 
-        self.pair_code_input = QLineEdit()
-        self.pair_code_input.setPlaceholderText("输入对方配对码")
-        self.pair_code_input.setMaximumWidth(150)
-        self.pair_code_input.setFont(QFont("Microsoft YaHei", 12))
-        self.pair_code_input.setMaxLength(6)
-        self.pair_code_input.hide()
+        manual_layout.addLayout(input_layout)
 
-        self.server_ip_input = QLineEdit()
-        self.server_ip_input.setPlaceholderText("对方IP地址")
-        self.server_ip_input.setMaximumWidth(150)
-        self.server_ip_input.hide()
+        manual_layout.addStretch()
 
-        self.connect_btn = QPushButton("连接")
-        self.connect_btn.clicked.connect(self._connect_to_server)
-        self.connect_btn.hide()
+        self.manual_widget.hide()
+        card.add_widget(self.manual_widget, 1)
 
-        self.cancel_btn = QPushButton("取消")
-        self.cancel_btn.clicked.connect(self._cancel_wait)
-        self.cancel_btn.hide()
+        # 已连接模式
+        self.connected_widget = QWidget()
+        self.connected_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        connected_layout = QVBoxLayout(self.connected_widget)
+        connected_layout.setContentsMargins(0, 8, 0, 0)
 
-        self.disconnect_btn = QPushButton("断开连接")
-        self.disconnect_btn.clicked.connect(self._disconnect)
-        self.disconnect_btn.hide()
+        connected_layout.addStretch()
 
-        code_layout.addWidget(code_label)
-        code_layout.addWidget(self.pair_code_display)
-        code_layout.addWidget(self.pair_code_input)
-        code_layout.addWidget(self.server_ip_input)
-        code_layout.addWidget(self.connect_btn)
-        code_layout.addWidget(self.cancel_btn)
-        code_layout.addWidget(self.disconnect_btn)
-        code_layout.addStretch()
+        info_layout = QHBoxLayout()
+        info_label = QLabel("已连接到:")
+        info_label.setStyleSheet(f"color: {THEME['text_secondary']};")
+        self.connected_peer_label = QLabel("-")
+        self.connected_peer_label.setStyleSheet(f"color: {THEME['success']}; font-weight: bold; font-size: 15px;")
+        info_layout.addWidget(info_label)
+        info_layout.addWidget(self.connected_peer_label)
+        info_layout.addStretch()
+        connected_layout.addLayout(info_layout)
 
-        group_layout.addLayout(code_layout)
-        layout.addWidget(group)
+        self.btn_disconnect = QPushButton("断开连接")
+        self.btn_disconnect.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {THEME['error']};
+                color: white;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #B91C1C;
+            }}
+        """)
+        self.btn_disconnect.clicked.connect(self._on_disconnect)
+        connected_layout.addWidget(self.btn_disconnect)
 
-    def _create_status_section(self, layout: QVBoxLayout):
-        """创建状态区域"""
-        group = QGroupBox("连接状态")
-        group_layout = QHBoxLayout(group)
+        connected_layout.addStretch()
 
-        self.status_label = QLabel("未连接")
-        self.status_label.setFont(QFont("Microsoft YaHei", 10))
-        self.status_label.setStyleSheet("color: #9E9E9E;")
+        self.connected_widget.hide()
+        card.add_widget(self.connected_widget, 1)
 
-        self.peer_label = QLabel()
+        return card
 
-        group_layout.addWidget(self.status_label)
-        group_layout.addWidget(self.peer_label)
-        group_layout.addStretch()
+    def _create_transfer_card(self) -> CardWidget:
+        card = CardWidget("文件传输", self)
 
-        layout.addWidget(group)
+        # 文件列表标题
+        file_title = QLabel("待发送文件 (拖拽文件到窗口)")
+        file_title.setStyleSheet(f"color: {THEME['text_secondary']}; font-weight: 600; font-size: 13px;")
+        card.add_widget(file_title)
 
-    def _create_transfer_section(self, layout: QVBoxLayout):
-        """创建文件传输区域"""
-        group = QGroupBox("文件传输")
-        group_layout = QVBoxLayout(group)
-
-        self.file_list_label = QLabel("待发送文件: (拖拽文件到窗口)")
+        # 文件列表 - 自动撑满，不限制高度
         self.file_list = QTextEdit()
         self.file_list.setReadOnly(True)
-        self.file_list.setMaximumHeight(80)
-        self.file_list.setPlaceholderText("拖拽文件或文件夹到这里...")
+        self.file_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.file_list.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {THEME['bg']};
+                border-radius: 8px;
+            }}
+        """)
+        card.add_widget(self.file_list, 1)
 
+        # 按钮行
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
 
-        self.add_file_btn = QPushButton("添加文件")
-        self.add_file_btn.clicked.connect(self._add_files)
+        self.btn_add_files = QPushButton("添加文件")
+        self.btn_add_files.clicked.connect(self._on_add_files)
+        btn_layout.addWidget(self.btn_add_files)
 
-        self.add_folder_btn = QPushButton("添加文件夹")
-        self.add_folder_btn.clicked.connect(self._add_folder)
+        self.btn_add_folder = QPushButton("添加文件夹")
+        self.btn_add_folder.clicked.connect(self._on_add_folder)
+        btn_layout.addWidget(self.btn_add_folder)
 
-        self.clear_files_btn = QPushButton("清空列表")
-        self.clear_files_btn.clicked.connect(self._clear_files)
+        self.btn_clear = self._create_outline_button("清空")
+        self.btn_clear.clicked.connect(self._on_clear_files)
+        btn_layout.addWidget(self.btn_clear)
 
-        self.send_btn = QPushButton("发送文件")
-        self.send_btn.clicked.connect(self._send_files)
-        self.send_btn.setEnabled(False)
+        btn_layout.addStretch()
 
-        btn_layout.addWidget(self.add_file_btn)
-        btn_layout.addWidget(self.add_folder_btn)
-        btn_layout.addWidget(self.clear_files_btn)
-        btn_layout.addWidget(self.send_btn)
+        self.btn_send = QPushButton("发送")
+        self.btn_send.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {THEME['success']};
+                color: white;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #059669;
+            }}
+            QPushButton:disabled {{
+                background-color: {THEME['border']};
+                color: {THEME['text_secondary']};
+            }}
+        """)
+        self.btn_send.setEnabled(False)
+        self.btn_send.clicked.connect(self._on_send_files)
+        btn_layout.addWidget(self.btn_send)
 
-        progress_layout = QHBoxLayout()
-        progress_label = QLabel("传输进度:")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_label = QLabel("")
+        card.add_layout(btn_layout)
 
-        progress_layout.addWidget(progress_label)
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.progress_label)
+        # 总进度区域
+        self.send_total_widget = QWidget()
+        total_layout = QVBoxLayout(self.send_total_widget)
+        total_layout.setContentsMargins(0, 8, 0, 0)
 
-        group_layout.addWidget(self.file_list_label)
-        group_layout.addWidget(self.file_list)
-        group_layout.addLayout(btn_layout)
-        group_layout.addLayout(progress_layout)
+        self.send_total_text = QLabel("总进度: 0 / 0 个文件")
+        self.send_total_text.setStyleSheet(f"color: {THEME['text']}; font-weight: 600;")
+        total_layout.addWidget(self.send_total_text)
 
+        self.send_total_bar = QProgressBar()
+        self.send_total_bar.setValue(0)
+        total_layout.addWidget(self.send_total_bar)
+
+        total_stats = QHBoxLayout()
+        self.send_total_percent = QLabel("0%")
+        self.send_total_size = QLabel("0 / 0 MB")
+        for lbl in [self.send_total_percent, self.send_total_size]:
+            lbl.setStyleSheet(f"color: {THEME['text_secondary']}; font-size: 12px;")
+            total_stats.addWidget(lbl)
+        total_stats.addStretch()
+        total_layout.addLayout(total_stats)
+
+        self.send_total_widget.hide()
+        card.add_widget(self.send_total_widget)
+
+        # 当前文件进度区域
+        self.send_progress_widget = QWidget()
+        send_progress_layout = QVBoxLayout(self.send_progress_widget)
+        send_progress_layout.setContentsMargins(0, 4, 0, 0)
+
+        self.send_progress_text = QLabel("发送: 准备传输...")
+        self.send_progress_text.setStyleSheet(f"color: {THEME['text']}; font-weight: 600;")
+        send_progress_layout.addWidget(self.send_progress_text)
+
+        self.send_progress_bar = QProgressBar()
+        self.send_progress_bar.setValue(0)
+        send_progress_layout.addWidget(self.send_progress_bar)
+
+        send_stats = QHBoxLayout()
+        self.send_progress_percent = QLabel("0%")
+        self.send_progress_size = QLabel("0 / 0 MB")
+        for lbl in [self.send_progress_percent, self.send_progress_size]:
+            lbl.setStyleSheet(f"color: {THEME['text_secondary']}; font-size: 12px;")
+            send_stats.addWidget(lbl)
+        send_stats.addStretch()
+        send_progress_layout.addLayout(send_stats)
+
+        self.send_progress_widget.hide()
+        card.add_widget(self.send_progress_widget)
+
+        # 接收进度区域
+        self.recv_progress_widget = QWidget()
+        recv_progress_layout = QVBoxLayout(self.recv_progress_widget)
+        recv_progress_layout.setContentsMargins(0, 8, 0, 0)
+
+        self.recv_progress_text = QLabel("接收: 等待中...")
+        self.recv_progress_text.setStyleSheet(f"color: {THEME['text']}; font-weight: 600;")
+        recv_progress_layout.addWidget(self.recv_progress_text)
+
+        self.recv_progress_bar = QProgressBar()
+        self.recv_progress_bar.setValue(0)
+        recv_progress_layout.addWidget(self.recv_progress_bar)
+
+        recv_stats = QHBoxLayout()
+        self.recv_progress_percent = QLabel("0%")
+        self.recv_progress_size = QLabel("0 / 0 MB")
+        for lbl in [self.recv_progress_percent, self.recv_progress_size]:
+            lbl.setStyleSheet(f"color: {THEME['text_secondary']}; font-size: 12px;")
+            recv_stats.addWidget(lbl)
+        recv_stats.addStretch()
+        recv_progress_layout.addLayout(recv_stats)
+
+        self.recv_progress_widget.hide()
+        card.add_widget(self.recv_progress_widget)
+
+        # 下载目录
         dir_layout = QHBoxLayout()
-        self.dir_label = QLabel(f"下载目录: {DEFAULT_DOWNLOAD_DIR}")
-        self.dir_label.setStyleSheet("color: #757575;")
-        open_dir_btn = QPushButton("打开目录")
-        open_dir_btn.clicked.connect(self._open_download_dir)
-        change_dir_btn = QPushButton("更改目录")
-        change_dir_btn.clicked.connect(self._change_download_dir)
+        dir_layout.setContentsMargins(0, 8, 0, 0)
 
-        dir_layout.addWidget(self.dir_label)
-        dir_layout.addStretch()
-        dir_layout.addWidget(change_dir_btn)
-        dir_layout.addWidget(open_dir_btn)
+        dir_label = QLabel("下载目录:")
+        dir_label.setStyleSheet(f"color: {THEME['text_secondary']}; font-size: 13px;")
+        dir_layout.addWidget(dir_label)
 
-        group_layout.addLayout(dir_layout)
-        layout.addWidget(group)
+        self.dir_label = QLabel(self._download_dir)
+        self.dir_label.setStyleSheet(f"color: {THEME['text']}; font-size: 13px;")
+        self.dir_label.setMinimumWidth(150)
+        dir_layout.addWidget(self.dir_label, 1)
 
-    def _create_log_section(self, layout: QVBoxLayout):
-        """创建日志区域"""
-        group = QGroupBox("传输日志")
-        group_layout = QVBoxLayout(group)
+        self.btn_open_dir = QPushButton("打开")
+        self.btn_open_dir.setStyleSheet("padding: 6px 12px; font-size: 12px;")
+        self.btn_open_dir.clicked.connect(self._on_open_dir)
+        dir_layout.addWidget(self.btn_open_dir)
 
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(100)
+        self.btn_change_dir = self._create_outline_button("更改")
+        self.btn_change_dir.setStyleSheet("padding: 6px 12px; font-size: 12px;")
+        self.btn_change_dir.clicked.connect(self._on_change_dir)
+        dir_layout.addWidget(self.btn_change_dir)
 
-        group_layout.addWidget(self.log_text)
-        layout.addWidget(group)
+        card.add_layout(dir_layout)
 
-    def _log(self, message: str):
-        """添加日志"""
-        self.log_text.append(message)
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        return card
 
-    # ==================== 服务器模式 ====================
+    def _create_log_card(self) -> CardWidget:
+        card = CardWidget("操作日志", self)
 
-    def _start_server(self):
-        """启动服务器模式"""
-        if self.server or self.client:
-            self._disconnect()
+        top_layout = QHBoxLayout()
+        top_layout.addStretch()
 
-        self.is_server_mode = True
-        self.server = LanShareServer()
+        self.btn_clear_log = self._create_outline_button("清空")
+        self.btn_clear_log.setStyleSheet("padding: 6px 12px; font-size: 12px;")
+        self.btn_clear_log.clicked.connect(self._on_clear_log)
+        top_layout.addWidget(self.btn_clear_log)
+        card.add_layout(top_layout)
 
-        # 设置回调
-        self.server.on_connected = lambda name: self.signals.connected.emit(name)
-        self.server.on_disconnected = lambda: self.signals.disconnected.emit()
-        self.server.on_error = lambda msg: self.signals.error.emit(msg)
-        self.server.on_file_info = self._on_file_info
-        self.server.on_file_data = self._on_file_data
-        self.server.on_resume_request = self._on_resume_request
+        self.log_list = QTextEdit()
+        self.log_list.setReadOnly(True)
+        self.log_list.setMinimumHeight(80)
+        self.log_list.setMaximumHeight(150)
+        self.log_list.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {THEME['bg']};
+                border-radius: 8px;
+            }}
+        """)
+        card.add_widget(self.log_list)
 
-        if self.server.start():
-            pair_code = self.server.generate_pair_code()
-            self.pair_code_display.setText(pair_code)
-            self.pair_code_display.show()
+        return card
 
-            self._update_status("等待连接...", "#FF9800")
-            self._log(f"房间已创建，配对码: {pair_code}")
+    def _create_outline_button(self, text: str) -> QPushButton:
+        """创建描边按钮"""
+        btn = QPushButton(text)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {THEME['primary']};
+                border: 1px solid {THEME['primary']};
+            }}
+            QPushButton:hover {{
+                background-color: #D1FAE5;
+            }}
+        """)
+        return btn
 
-            self.server_btn.setEnabled(False)
-            self.client_btn.setEnabled(False)
-            self.cancel_btn.show()
+    def _center_window(self):
+        screen = QDesktopWidget().screenGeometry()
+        size = self.geometry()
+        self.move(
+            (screen.width() - size.width()) // 2,
+            (screen.height() - size.height()) // 2
+        )
 
-            # 初始化传输管理器
-            self.transfer_manager = FileTransferManager(
-                self.file_handler,
-                self.signals,
-                self.server.send
-            )
-        else:
-            self._show_error("启动服务器失败")
-            self.server = None
+    # ==================== 信号连接 ====================
 
-    # ==================== 客户端模式 ====================
+    def _connect_signals(self):
+        self._signals.log.connect(self._append_log)
+        self._signals.status_changed.connect(self._update_status)
+        self._signals.peer_changed.connect(self._set_peer_name)
+        self._signals.connected.connect(self._handle_connected)
+        self._signals.disconnected.connect(self._handle_disconnected)
+        self._signals.send_progress.connect(self._update_send_progress)
+        self._signals.send_total_progress.connect(self._update_send_total_progress)
+        self._signals.send_completed.connect(self._handle_send_completed)
+        self._signals.recv_progress.connect(self._update_recv_progress)
+        self._signals.recv_file_info.connect(self._handle_recv_file_info)
+        self._signals.recv_completed.connect(self._handle_recv_completed)
+        self._signals.room_found.connect(self._handle_room_found)
+        self._signals.room_expired.connect(self._handle_room_expired)
 
-    def _show_client_input(self):
-        """显示客户端输入框"""
-        if self.server or self.client:
-            self._disconnect()
+    def _get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            self._local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            self._local_ip = "127.0.0.1"
+        self.ip_value.setText(self._local_ip)
 
-        self.is_server_mode = False
-        self.pair_code_display.hide()
-        self.pair_code_input.show()
-        self.server_ip_input.show()
-        self.connect_btn.show()
+    # ==================== 事件处理 ====================
 
-        self.server_btn.setEnabled(False)
-        self.client_btn.setEnabled(False)
+    def _on_create_room(self):
+        pair_code = ''.join(random.choices(string.digits, k=6))
 
-    def _connect_to_server(self):
-        """连接到服务器"""
-        pair_code = self.pair_code_input.text().strip().upper()
-        server_ip = self.server_ip_input.text().strip()
+        try:
+            self._server = LanShareServer()
+            self._server.on_connected = lambda name: self._signals.connected.emit(name)
+            self._server.on_disconnected = lambda: self._signals.disconnected.emit()
+            self._server.on_error = lambda err: self._signals.log.emit(f"服务器错误: {err}")
+            self._server.on_file_info = self._on_recv_file_info
+            self._server.on_file_data = self._on_recv_file_data
+            self._server.on_data_ack = self._on_data_ack
+            self._server.start()
 
-        if not pair_code:
-            self._show_error("请输入配对码")
+            # 设置配对码 (供客户端配对用)
+            self._server.pair_code = pair_code
+
+            self._signals.status_changed.emit("等待连接", THEME['warning'])
+            self._signals.log.emit(f"已创建房间，配对码: {pair_code}")
+            self._show_waiting_mode(pair_code)
+
+            self._start_broadcast(pair_code)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"创建房间失败: {e}")
+            self._signals.log.emit(f"创建房间失败: {e}")
+
+    def _on_join_room(self):
+        self.btn_create.hide()
+        self.btn_join.hide()
+        self.room_list_widget.show()
+        self.manual_widget.show()
+        self._signals.log.emit("正在扫描局域网房间...")
+        self._start_discovery()
+
+    def _on_cancel_wait(self):
+        self._stop_broadcast()
+        if self._server:
+            self._server.stop()
+            self._server = None
+        self._signals.status_changed.emit("未连接", THEME['text_secondary'])
+        self._show_idle_mode()
+        self._signals.log.emit("已取消创建房间")
+
+    def _on_cancel_discovery(self):
+        self._stop_discovery()
+        self._signals.status_changed.emit("未连接", THEME['text_secondary'])
+        self._show_idle_mode()
+        self._signals.log.emit("已取消扫描")
+
+    def _copy_pair_code(self):
+        code = self.pair_code_label.text()
+        if code and code != "------":
+            clipboard = QApplication.clipboard()
+            clipboard.setText(code)
+            self._signals.log.emit(f"配对码 {code} 已复制到剪贴板")
+
+    def _on_manual_connect(self):
+        ip = self.input_ip.text().strip()
+        code = self.input_code.text().strip().upper()
+
+        if not ip or not code:
+            QMessageBox.warning(self, "提示", "请输入IP地址和配对码")
             return
 
-        if not server_ip:
-            self._show_error("请输入对方IP地址")
+        self._stop_discovery()
+        self._signals.status_changed.emit("连接中", THEME['warning'])
+        self._signals.log.emit(f"正在连接到 {ip}...")
+
+        def connect_thread():
+            try:
+                client = LanShareClient()
+                client.on_connected = lambda name: self._signals.connected.emit(name)
+                client.on_disconnected = lambda: self._signals.disconnected.emit()
+                client.on_error = lambda err: self._signals.log.emit(f"连接错误: {err}")
+                client.on_file_info = self._on_recv_file_info
+                client.on_file_data = self._on_recv_file_data
+                client.on_data_ack = self._on_data_ack
+
+                success = client.connect(ip, code)
+                if success:
+                    self._client = client
+                else:
+                    self._signals.status_changed.emit("未连接", THEME['text_secondary'])
+                    self._signals.log.emit("连接失败")
+            except Exception as e:
+                self._signals.status_changed.emit("未连接", THEME['text_secondary'])
+                self._signals.log.emit(f"连接失败: {e}")
+
+        threading.Thread(target=connect_thread, daemon=True).start()
+
+    def _on_disconnect(self):
+        self._stop_sending()
+        self._stop_broadcast()
+        self._stop_discovery()
+
+        if self._server:
+            self._server.stop()
+            self._server = None
+        if self._client:
+            self._client.disconnect()
+            self._client = None
+
+        self._signals.status_changed.emit("未连接", THEME['text_secondary'])
+        self._signals.peer_changed.emit("-")
+        self._show_idle_mode()
+        self._signals.log.emit("已断开连接")
+
+    def _on_add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择文件", get_last_file_dir()
+        )
+        if files:
+            set_last_file_dir(str(Path(files[0]).parent))
+            for f in files:
+                if f not in self._files_to_send:
+                    self._files_to_send.append(f)
+            self._update_file_list()
+
+    def _on_add_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择文件夹", get_last_folder_dir()
+        )
+        if folder:
+            set_last_folder_dir(folder)
+            for path in Path(folder).rglob('*'):
+                if path.is_file():
+                    full_path = str(path)
+                    if full_path not in self._files_to_send:
+                        self._files_to_send.append(full_path)
+            self._update_file_list()
+
+    def _on_clear_files(self):
+        self._files_to_send = []
+        self._update_file_list()
+
+    def _on_send_files(self):
+        if not self._files_to_send:
             return
 
-        self.client = LanShareClient()
+        transport = self._get_transport()
+        if not transport:
+            self._signals.log.emit("未连接到对方设备")
+            return
 
-        # 设置回调
-        self.client.on_connected = lambda name: self.signals.connected.emit(name)
-        self.client.on_disconnected = lambda: self.signals.disconnected.emit()
-        self.client.on_error = lambda msg: self.signals.error.emit(msg)
-        self.client.on_file_info = self._on_file_info
-        self.client.on_file_data = self._on_file_data
-        self.client.on_resume_ok = self._on_resume_ok
-        self.client.on_file_complete = self._on_file_complete_msg
+        if self._sending:
+            self._signals.log.emit("正在发送中，请等待完成")
+            return
 
-        self._update_status("正在连接...", "#FF9800")
-        self._log(f"正在连接 {server_ip}，配对码: {pair_code}")
+        self._sending = True
+        self.btn_send.setEnabled(False)
+        self.send_total_widget.show()
+        self.send_progress_widget.show()
+        files = self._files_to_send.copy()
 
-        if self.client.connect(server_ip, pair_code):
-            self.pair_code_input.hide()
-            self.server_ip_input.hide()
-            self.connect_btn.hide()
-            self.disconnect_btn.show()
+        # 计算总大小
+        total_size = sum(Path(f).stat().st_size for f in files)
 
-            # 初始化传输管理器
-            self.transfer_manager = FileTransferManager(
-                self.file_handler,
-                self.signals,
-                self.client.send
+        self._signals.log.emit(f"开始发送 {len(files)} 个文件...")
+        self._signals.send_total_progress.emit(
+            0, 0, len(files), self._format_size(0), self._format_size(total_size)
+        )
+
+        def send_thread():
+            try:
+                completed = 0
+                sent_bytes = 0
+                has_failed = False
+
+                for file_path in files:
+                    sender = ChunkedFileSender(
+                        state_manager=self._transfer_state_manager,
+                        on_send_chunk=lambda idx, data: transport.send(
+                            MessageBuilder.file_data(idx, data)
+                        )
+                    )
+                    self._current_sender = sender
+
+                    filename, file_size, file_hash, is_folder = sender.prepare(file_path)
+                    cs = sender.current_state.chunk_size
+
+                    def make_progress(fn, fs, chunk_size):
+                        def progress_cb(acked, total):
+                            pct = int(acked / total * 100) if total > 0 else 0
+                            self._signals.send_progress.emit(
+                                pct, fn,
+                                self._format_size(acked * chunk_size),
+                                self._format_size(fs)
+                            )
+                        return progress_cb
+
+                    sender.on_progress = make_progress(filename, file_size, cs)
+
+                    # 通知接收方
+                    transport.send(MessageBuilder.file_info(
+                        filename, file_size, file_hash, is_folder
+                    ))
+                    time.sleep(0.05)
+
+                    # 滑动窗口发送
+                    success = sender.send_with_window()
+                    sender.complete()
+                    self._current_sender = None
+
+                    if success:
+                        completed += 1
+                        sent_bytes += file_size
+                        self._signals.log.emit(f"已发送: {filename}")
+                    else:
+                        has_failed = True
+                        self._signals.log.emit(f"发送失败: {filename}")
+
+                    # 更新总进度
+                    self._signals.send_total_progress.emit(
+                        completed, completed, len(files),
+                        self._format_size(sent_bytes),
+                        self._format_size(total_size)
+                    )
+
+                if has_failed:
+                    self._signals.send_completed.emit(
+                        False, f"部分文件发送失败 ({completed}/{len(files)})"
+                    )
+                else:
+                    self._signals.send_completed.emit(
+                        True, f"成功发送 {len(files)} 个文件"
+                    )
+            except Exception as e:
+                self._current_sender = None
+                self._signals.send_completed.emit(False, f"发送失败: {e}")
+
+        threading.Thread(target=send_thread, daemon=True).start()
+
+    def _on_open_dir(self):
+        import subprocess
+        subprocess.Popen(f'explorer "{self._download_dir}"')
+
+    def _on_change_dir(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择下载目录", self._download_dir
+        )
+        if folder:
+            self._download_dir = folder
+            self.dir_label.setText(folder)
+            self._file_handler = FileHandler(folder)
+            self._signals.log.emit(f"下载目录已更改为: {folder}")
+
+    def _on_clear_log(self):
+        self.log_list.clear()
+
+    # ==================== 接收回调 (从网络线程调用) ====================
+
+    def _on_recv_file_info(self, msg_data: dict):
+        """收到文件信息 - 网络线程调用"""
+        filename = msg_data.get('filename', 'unknown')
+        file_size = msg_data.get('filesize', 0)
+        file_hash = msg_data.get('hash', '')
+        chunk_size = CHUNK_SIZE
+
+        self._signals.recv_file_info.emit(filename, file_size)
+        self._signals.log.emit(f"正在接收: {filename} ({self._format_size(file_size)})")
+
+        # 创建接收器
+        try:
+            receiver = ChunkedFileReceiver(
+                state_manager=self._transfer_state_manager,
+                download_dir=Path(self._download_dir),
+                on_progress=lambda r, t: self._signals.recv_progress.emit(
+                    int(r / t * 100) if t > 0 else 0,
+                    self._format_size(r * chunk_size),
+                    self._format_size(t * chunk_size)
+                ),
+                on_send_ack=lambda acks: self._send_recv_ack(acks)
             )
-        else:
-            self.client = None
+            receiver.start_receive(filename, file_size, file_hash, chunk_size=chunk_size)
+            self._chunk_receiver = receiver
 
-    # ==================== 连接管理 ====================
+            # 断点续传：通知发送方已有哪些块，跳过重传
+            if receiver._received_set:
+                self._signals.log.emit(
+                    f"断点续传: 已有 {len(receiver._received_set)} 个块，跳过"
+                )
+                self._send_recv_ack(sorted(receiver._received_set))
+        except Exception as e:
+            self._signals.log.emit(f"准备接收失败: {e}")
 
-    def _disconnect(self):
-        """断开连接"""
-        if self.transfer_manager:
-            self.transfer_manager.cancel()
+    def _on_recv_file_data(self, data: bytes):
+        """收到文件数据 - 网络线程调用"""
+        if not self._chunk_receiver:
+            return
+        try:
+            chunk_index, actual_data = MessageBuilder.decode_file_data(data)
+            self._chunk_receiver.write_chunk(chunk_index, actual_data)
 
-        if self.server:
-            self.server.stop()
-            self.server = None
+            # 检查是否完成
+            if self._chunk_receiver.is_complete():
+                result = self._chunk_receiver.complete()
+                if result:
+                    self._signals.recv_completed.emit(True, f"已保存: {result}")
+                else:
+                    self._signals.recv_completed.emit(False, "接收完成但保存失败")
+                self._chunk_receiver = None
+        except Exception as e:
+            self._signals.log.emit(f"接收数据错误: {e}")
 
-        if self.client:
-            self.client.disconnect()
-            self.client = None
+    def _on_data_ack(self, msg_data: dict):
+        """收到数据确认 - 网络线程调用，转发给滑动窗口发送器"""
+        if self._current_sender:
+            chunk_indices = msg_data.get('chunk_indices', [])
+            if chunk_indices:
+                self._current_sender.handle_ack_batch(chunk_indices)
 
-        self._reset_ui()
+    def _send_recv_ack(self, chunk_indices: list):
+        """发送接收确认"""
+        transport = self._get_transport()
+        if transport:
+            try:
+                transport.send(MessageBuilder.data_ack_batch(chunk_indices))
+            except Exception:
+                pass
 
-    def _cancel_wait(self):
-        """取消等待连接"""
-        self._disconnect()
-        self._log("已取消等待")
-
-    def _reset_ui(self):
-        """重置UI状态"""
-        self.is_server_mode = False
-        self.pair_code_display.clear()
-        self.pair_code_display.show()
-        self.pair_code_input.hide()
-        self.server_ip_input.hide()
-        self.connect_btn.hide()
-        self.cancel_btn.hide()
-        self.disconnect_btn.hide()
-
-        self.server_btn.setEnabled(True)
-        self.client_btn.setEnabled(True)
-        self.send_btn.setEnabled(False)
-
-        self._update_status("未连接", "#9E9E9E")
-        self.peer_label.clear()
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("")
-
-    def _update_status(self, text: str, color: str = "#9E9E9E"):
-        """更新状态显示"""
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"color: {color};")
-
-    def _on_reconnect_status(self, status: str):
-        """重连状态更新"""
-        self._update_status(status, "#FF9800")
-
-    # ==================== 文件操作 ====================
+    # ==================== 拖拽支持 ====================
 
     def dragEnterEvent(self, event: QDragEnterEvent):
-        """拖拽进入事件"""
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event: QDropEvent):
-        """拖拽放下事件"""
         urls = event.mimeData().urls()
         for url in urls:
-            filepath = url.toLocalFile()
-            if Path(filepath).exists():
-                self.pending_files.append(filepath)
+            path = url.toLocalFile()
+            if path:
+                p = Path(path)
+                if p.is_file():
+                    if path not in self._files_to_send:
+                        self._files_to_send.append(path)
+                elif p.is_dir():
+                    for fp in p.rglob('*'):
+                        if fp.is_file():
+                            full_path = str(fp)
+                            if full_path not in self._files_to_send:
+                                self._files_to_send.append(full_path)
         self._update_file_list()
+        event.acceptProposedAction()
 
-    def _add_files(self):
-        """添加文件"""
-        last_dir = get_last_file_dir()
-        files, _ = QFileDialog.getOpenFileNames(self, "选择文件", last_dir)
-        if files:
-            self.pending_files.extend(files)
-            # 记住选择的目录
-            set_last_file_dir(str(Path(files[0]).parent))
-        self._update_file_list()
+    # ==================== 广播与发现 ====================
 
-    def _add_folder(self):
-        """添加文件夹"""
-        last_dir = get_last_folder_dir()
-        folder = QFileDialog.getExistingDirectory(self, "选择文件夹", last_dir)
-        if folder:
-            self.pending_files.append(folder)
-            # 记住选择的目录
-            set_last_folder_dir(folder)
-        self._update_file_list()
+    def _start_broadcast(self, pair_code: str):
+        self._stop_broadcast()
+        hostname = platform.node()
+        self._broadcaster = RoomBroadcaster(
+            port=DEFAULT_PORT,
+            hostname=hostname,
+            pair_code=pair_code
+        )
+        self._broadcaster.start()
 
-    def _clear_files(self):
-        """清空文件列表"""
-        self.pending_files.clear()
-        self._update_file_list()
+    def _stop_broadcast(self):
+        if self._broadcaster:
+            self._broadcaster.stop()
+            self._broadcaster = None
+
+    def _start_discovery(self):
+        self._stop_discovery()
+        self.room_list.clear()
+        # 清空旧的房间按钮
+        for ip, btn in self._room_buttons.items():
+            self.room_buttons_layout.removeWidget(btn)
+            btn.deleteLater()
+        self._room_buttons.clear()
+        self.room_buttons_widget.hide()
+
+        def on_room_found(room: RoomInfo):
+            self._signals.room_found.emit(room.hostname, room.ip, room.pair_code)
+
+        def on_room_expired(room: RoomInfo):
+            self._signals.room_expired.emit(room.ip)
+
+        self._scanner = RoomScanner(
+            on_room_found=on_room_found,
+            on_room_expired=on_room_expired
+        )
+        self._scanner.start()
+
+    def _stop_discovery(self):
+        if self._scanner:
+            self._scanner.stop()
+            self._scanner = None
+
+    # ==================== UI 更新 (通过信号, GUI线程安全) ====================
+
+    def _append_log(self, message: str):
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_list.append(
+            f"<span style='color: #9CA3AF;'>[{timestamp}]</span> {message}"
+        )
+
+    def _update_status(self, status: str, color: str):
+        self._connection_status = status
+        self.status_value.setText(status)
+        self.status_value.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _set_peer_name(self, name: str):
+        self._peer_name = name
+        self.peer_value.setText(name)
+
+    def _handle_connected(self, peer_name: str):
+        self._update_status("已连接", THEME['success'])
+        self._set_peer_name(peer_name)
+        self._stop_discovery()
+        self._stop_broadcast()
+        self._show_connected_mode(peer_name)
+        self._append_log(f"已连接到: {peer_name}")
+
+    def _handle_disconnected(self):
+        self._stop_sending()
+        self._update_status("未连接", THEME['text_secondary'])
+        self._set_peer_name("-")
+        self._show_idle_mode()
+        self._append_log("连接已断开")
+        self._server = None
+        self._client = None
+
+    def _update_send_progress(self, percent: int, filename: str, transferred: str, total: str):
+        self.send_progress_text.setText(f"发送: {filename}")
+        self.send_progress_bar.setValue(percent)
+        self.send_progress_percent.setText(f"{percent}%")
+        self.send_progress_size.setText(f"{transferred} / {total}")
+
+    def _update_send_total_progress(self, done: int, current: int, total: int, transferred: str, total_size: str):
+        self.send_total_text.setText(f"总进度: {done} / {total} 个文件")
+        percent = int(done / total * 100) if total > 0 else 0
+        self.send_total_bar.setValue(percent)
+        self.send_total_percent.setText(f"{percent}%")
+        self.send_total_size.setText(f"{transferred} / {total_size}")
+
+    def _update_recv_progress(self, percent: int, received: str, total: str):
+        self.recv_progress_widget.show()
+        self.recv_progress_bar.setValue(percent)
+        self.recv_progress_percent.setText(f"{percent}%")
+        self.recv_progress_size.setText(f"{received} / {total}")
+        self.recv_progress_text.setText(f"接收中... {percent}%")
+
+    def _handle_send_completed(self, success: bool, message: str):
+        self._sending = False
+        self._current_sender = None
+        self._append_log(message)
+        self.send_progress_widget.hide()
+        self.send_total_widget.hide()
+        if success:
+            self._files_to_send = []
+            self._update_file_list()
+        self.btn_send.setEnabled(len(self._files_to_send) > 0 and self._is_connected())
+
+    def _handle_recv_file_info(self, filename: str, size: int):
+        self.recv_progress_widget.show()
+        self.recv_progress_bar.setValue(0)
+        self.recv_progress_text.setText(f"接收: {filename}")
+
+    def _handle_recv_completed(self, success: bool, message: str):
+        self._append_log(message)
+        if success:
+            self.recv_progress_widget.hide()
+
+    def _handle_room_found(self, name: str, ip: str, pair_code: str):
+        if ip in self._room_buttons:
+            return
+        btn = QPushButton(f"{name} ({ip})\n配对码: {pair_code}")
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {THEME['bg']};
+                color: {THEME['text']};
+                border: 1px solid {THEME['border']};
+                border-radius: 8px;
+                padding: 12px 16px;
+                text-align: left;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background-color: {THEME['primary_light']};
+                border-color: {THEME['primary']};
+            }}
+        """)
+        btn.clicked.connect(lambda checked, i=ip, c=pair_code: self._on_room_clicked(i, c))
+        self._room_buttons[ip] = btn
+        self.room_buttons_layout.addWidget(btn)
+        self.room_list.hide()
+        self.room_buttons_widget.show()
+
+    def _on_room_clicked(self, ip: str, pair_code: str):
+        self._signals.log.emit(f"正在连接到 {ip}...")
+        self._stop_discovery()
+
+        def connect_thread():
+            try:
+                client = LanShareClient()
+                client.on_connected = lambda name: self._signals.connected.emit(name)
+                client.on_disconnected = lambda: self._signals.disconnected.emit()
+                client.on_error = lambda err: self._signals.log.emit(f"连接错误: {err}")
+                client.on_file_info = self._on_recv_file_info
+                client.on_file_data = self._on_recv_file_data
+                client.on_data_ack = self._on_data_ack
+
+                success = client.connect(ip, pair_code)
+                if success:
+                    self._client = client
+                else:
+                    self._signals.status_changed.emit("未连接", THEME['text_secondary'])
+                    self._signals.log.emit("连接失败")
+            except Exception as e:
+                self._signals.status_changed.emit("未连接", THEME['text_secondary'])
+                self._signals.log.emit(f"连接失败: {e}")
+
+        threading.Thread(target=connect_thread, daemon=True).start()
+
+    def _handle_room_expired(self, ip: str):
+        btn = self._room_buttons.pop(ip, None)
+        if btn:
+            self.room_buttons_layout.removeWidget(btn)
+            btn.deleteLater()
+            if not self._room_buttons:
+                self.room_buttons_widget.hide()
+
+    # ==================== 模式切换 ====================
+
+    def _show_idle_mode(self):
+        self.btn_create.show()
+        self.btn_join.show()
+        self.waiting_widget.hide()
+        self.room_list_widget.hide()
+        self.manual_widget.hide()
+        self.connected_widget.hide()
+        self.btn_send.setEnabled(False)
+
+    def _show_waiting_mode(self, pair_code: str):
+        self.btn_create.hide()
+        self.btn_join.hide()
+        self.waiting_widget.show()
+        self.room_list_widget.hide()
+        self.manual_widget.hide()
+        self.connected_widget.hide()
+        self.pair_code_label.setText(pair_code)
+
+    def _show_connected_mode(self, peer_name: str):
+        self.btn_create.hide()
+        self.btn_join.hide()
+        self.waiting_widget.hide()
+        self.room_list_widget.hide()
+        self.manual_widget.hide()
+        self.connected_widget.show()
+        self.connected_peer_label.setText(peer_name)
+        self.btn_send.setEnabled(len(self._files_to_send) > 0)
+
+    # ==================== 文件列表更新 ====================
 
     def _update_file_list(self):
-        """更新文件列表显示"""
-        if self.pending_files:
-            file_names = [Path(f).name for f in self.pending_files]
-            self.file_list.setText('\n'.join(file_names))
-            self.send_btn.setEnabled(bool(self.server or self.client) and
-                                     self.transfer_manager and
-                                     not self.transfer_manager.is_sending)
-        else:
-            self.file_list.clear()
-            self.send_btn.setEnabled(False)
-
-    def _open_download_dir(self):
-        """打开下载目录"""
-        import subprocess
-        if sys.platform == 'win32':
-            subprocess.run(['explorer', self.download_dir])
-        elif sys.platform == 'darwin':
-            subprocess.run(['open', self.download_dir])
-        else:
-            subprocess.run(['xdg-open', self.download_dir])
-
-    def _change_download_dir(self):
-        """更改下载目录"""
-        new_dir = QFileDialog.getExistingDirectory(
-            self,
-            "选择下载目录",
-            self.download_dir
-        )
-        if new_dir:
-            self.download_dir = new_dir
-            self.dir_label.setText(f"下载目录: {new_dir}")
-            self.file_handler = FileHandler(new_dir)
-            if self.transfer_manager:
-                self.transfer_manager.file_handler = self.file_handler
-            self._log(f"下载目录已更改为: {new_dir}")
-
-    # ==================== 文件传输 ====================
-
-    def _send_files(self):
-        """发送文件"""
-        if not self.pending_files:
-            return
-
-        if self.transfer_manager and self.transfer_manager.is_sending:
-            self._show_error("正在发送中...")
-            return
-
-        filepath = self.pending_files.pop(0)
-        self._update_file_list()
-
-        # 获取对方设备ID
-        peer_device_id = ''
-        if self.server and self.server.client_device_id:
-            peer_device_id = self.server.client_device_id
-        elif self.client:
-            peer_device_id = self.client.server_device_id or ''
-
-        def on_complete():
-            self.send_btn.setEnabled(bool(self.pending_files))
-            if self.pending_files:
-                self._send_files()
-
-        self.transfer_manager.start_send(filepath, peer_device_id, on_complete)
-
-    def _on_file_info(self, info: dict):
-        """处理接收到的文件信息"""
-        if self.transfer_manager:
-            self.transfer_manager.start_receive(info)
-
-            # 检查是否有续传请求需要发送
-            chunks = self.transfer_manager.get_pending_resume_chunks()
-            if chunks and self.server:
-                file_hash = info.get('hash', '')
-                self.server.send(MessageBuilder.file_resume(file_hash, chunks, ''))
-
-    def _on_file_data(self, data: bytes):
-        """处理接收到的文件数据"""
-        if self.transfer_manager:
+        self.file_list.clear()
+        for f in self._files_to_send:
+            path = Path(f)
             try:
-                chunk_index, actual_data = MessageBuilder.decode_file_data(data)
-                self.transfer_manager.receive_data(chunk_index, actual_data)
-            except Exception as e:
-                self.signals.error.emit(f"解析文件数据失败: {str(e)}")
+                size = path.stat().st_size
+                size_str = self._format_size(size)
+                self.file_list.append(f"{path.name} ({size_str})")
+            except OSError:
+                self.file_list.append(f"{path.name} (文件不存在)")
+        self.btn_send.setEnabled(len(self._files_to_send) > 0 and self._is_connected())
 
-    def _on_resume_request(self, msg_data: dict):
-        """处理续传请求（服务器端）"""
-        file_hash = msg_data.get('file_hash', '')
-        received_chunks = msg_data.get('received_chunks', [])
+    # ==================== 辅助方法 ====================
 
-        if self.transfer_manager and self.transfer_manager.sender:
-            # 更新发送器状态
-            self.transfer_manager.resume_send(received_chunks)
+    def _get_transport(self):
+        """获取当前传输通道 (client 或 server)"""
+        if self._client and self._client.connected:
+            return self._client
+        if self._server and self._server.connected:
+            return self._server
+        return None
 
-            # 发送确认
-            needed = self.transfer_manager.sender.get_needed_chunks(received_chunks)
-            self.server.send_resume_ok(file_hash, needed)
+    def _is_connected(self):
+        return self._connection_status == "已连接"
 
-    def _on_resume_ok(self, msg_data: dict):
-        """处理续传确认（客户端）"""
-        file_hash = msg_data.get('file_hash', '')
-        needed_chunks = msg_data.get('needed_chunks', [])
+    def _stop_sending(self):
+        self._sending = False
+        if self._current_sender:
+            try:
+                self._current_sender.cancel()
+            except Exception:
+                pass
+            self._current_sender = None
+        if self._chunk_receiver:
+            try:
+                self._chunk_receiver.cancel()
+            except Exception:
+                pass
+            self._chunk_receiver = None
 
-        if self.transfer_manager and self.transfer_manager.sender:
-            self._log(f"续传确认: 需要发送 {len(needed_chunks)} 块")
-
-    def _on_file_complete_msg(self, msg_data: dict):
-        """处理传输完成消息"""
-        success = msg_data.get('success', False)
-        file_hash = msg_data.get('file_hash', '')
-        if success:
-            self._log(f"传输完成: {file_hash[:8]}...")
-
-    def _on_progress(self, current: int, total: int):
-        """更新进度"""
-        if total > 0:
-            percent = int(current / total * 100)
-            self.progress_bar.setValue(percent)
-            self.progress_label.setText(f"{current}/{total} 块")
-
-    def _on_file_complete(self, filepath: str):
-        """文件接收完成"""
-        self.progress_bar.setValue(100)
-        self.progress_label.setText("完成")
-
-    # ==================== 信号处理 ====================
-
-    def _on_connected(self, peer_name: str):
-        """连接成功"""
-        self._update_status("已连接", "#4CAF50")
-        self.peer_label.setText(f"对方: {peer_name}")
-        self.cancel_btn.hide()
-        self.disconnect_btn.show()
-        self.send_btn.setEnabled(bool(self.pending_files))
-        self._log(f"已连接到: {peer_name}")
-
-    def _on_disconnected(self):
-        """连接断开"""
-        self._log("连接已断开")
-        self._reset_ui()
-
-    def _show_error(self, message: str):
-        """显示错误消息"""
-        QMessageBox.warning(self, "错误", message)
-        self._log(f"错误: {message}")
+    @staticmethod
+    def _format_size(bytes_val: float) -> str:
+        """格式化文件大小"""
+        if bytes_val <= 0:
+            return "0 B"
+        units = ['B', 'KB', 'MB', 'GB', 'TB']
+        i = min(int(math.log(bytes_val) / math.log(1024)), len(units) - 1)
+        size = bytes_val / (1024 ** i)
+        if size >= 100:
+            return f"{size:.0f} {units[i]}"
+        elif size >= 10:
+            return f"{size:.1f} {units[i]}"
+        else:
+            return f"{size:.2f} {units[i]}"
 
     def closeEvent(self, event):
-        """窗口关闭事件"""
-        self._disconnect()
+        self._stop_sending()
+        self._stop_broadcast()
+        self._stop_discovery()
+        if self._server:
+            self._server.stop()
+        if self._client:
+            self._client.disconnect()
         event.accept()

@@ -8,7 +8,7 @@ from .protocol import Protocol, MessageType, MessageBuilder
 from .reconnect import HeartbeatManager, ConnectionMonitor
 from config import (
     DEFAULT_PORT, SOCKET_CONFIG,
-    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT
+    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, CHUNK_SIZE
 )
 from trust.device_manager import DeviceManager
 
@@ -21,6 +21,9 @@ class LanShareClient:
         self.running = False
         self.connected = False
         self.hostname = platform.node()
+
+        # Socket 操作锁（避免发送和接收冲突）
+        self._socket_lock = threading.Lock()
 
         # 设备管理
         self.device_manager = DeviceManager()
@@ -38,6 +41,7 @@ class LanShareClient:
         self.on_error: Optional[Callable[[str], None]] = None
         self.on_resume_ok: Optional[Callable[[dict], None]] = None
         self.on_file_complete: Optional[Callable[[dict], None]] = None
+        self.on_data_ack: Optional[Callable[[dict], None]] = None  # 滑动窗口确认
 
     def connect(self, server_ip: str, pair_code: str, port: int = DEFAULT_PORT) -> bool:
         """
@@ -190,11 +194,14 @@ class LanShareClient:
     def _message_loop(self):
         """消息接收循环"""
         buffer = b''
+        # 使用动态缓冲区大小（基于块大小）
+        recv_buffer = max(CHUNK_SIZE + 1024, 65536)
 
         while self.running and self.connected:
             try:
+                # TCP socket 支持全双工，不需要锁保护 recv
                 self.socket.settimeout(1.0)
-                data = self.socket.recv(4096)
+                data = self.socket.recv(recv_buffer)
                 if not data:
                     self._handle_disconnect()
                     break
@@ -263,6 +270,11 @@ class LanShareClient:
             if self.on_file_complete:
                 self.on_file_complete(msg_data)
 
+        elif msg_type == MessageType.DATA_ACK:
+            # 滑动窗口确认
+            if self.on_data_ack:
+                self.on_data_ack(msg_data)
+
         elif msg_type == MessageType.FILE_ERROR:
             if self.on_error:
                 self.on_error(msg_data.get('error', '未知错误'))
@@ -293,7 +305,13 @@ class LanShareClient:
             return False
 
         try:
-            self.socket.send(data)
+            with self._socket_lock:
+                old_timeout = self.socket.gettimeout()
+                self.socket.settimeout(None)
+                try:
+                    self.socket.sendall(data)
+                finally:
+                    self.socket.settimeout(old_timeout)
             return True
         except Exception as e:
             if self.on_error:
@@ -311,6 +329,15 @@ class LanShareClient:
     def send_file_complete(self, file_hash: str, success: bool = True) -> bool:
         """发送传输完成确认"""
         return self.send(MessageBuilder.file_complete(file_hash, success))
+
+    def send_data_ack(self, chunk_indices: list) -> bool:
+        """发送批量数据确认"""
+        return self.send(MessageBuilder.data_ack_batch(chunk_indices))
+
+    def set_transfer_mode(self, enabled: bool):
+        """设置传输模式（延长心跳超时）"""
+        if self.heartbeat:
+            self.heartbeat.set_transfer_mode(enabled)
 
     def disconnect(self):
         """断开连接"""

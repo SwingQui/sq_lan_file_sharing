@@ -22,7 +22,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'PyQt5.QtWebEngineWidgets',
+        'PyQt5.QtWebEngineCore',
+        'PyQt5.QtWebChannel',
+        'PyQt5.QtWebEngine',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

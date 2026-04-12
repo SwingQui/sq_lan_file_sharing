@@ -163,7 +163,7 @@ class ReconnectManager:
 
 
 class HeartbeatManager:
-    """心跳管理器"""
+    """心跳管理器 - 优化版，支持传输期间延长超时"""
 
     def __init__(self,
                  sock: socket.socket,
@@ -187,6 +187,10 @@ class HeartbeatManager:
         self._last_response_time: float = time.time()
         self._lock = threading.Lock()
 
+        # 传输模式标记（传输期间延长超时）
+        self._transfer_mode = False
+        self._transfer_timeout: float = timeout * 3  # 传输期间超时时间延长3倍
+
     def start(self):
         """启动心跳"""
         self.running = True
@@ -194,6 +198,18 @@ class HeartbeatManager:
 
         self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._thread.start()
+
+    def set_transfer_mode(self, enabled: bool):
+        """
+        设置传输模式
+        Args:
+            enabled: 是否启用传输模式
+        """
+        with self._lock:
+            self._transfer_mode = enabled
+            if enabled:
+                # 进入传输模式，重置最后响应时间
+                self._last_response_time = time.time()
 
     def _heartbeat_loop(self):
         """心跳循环"""
@@ -204,7 +220,10 @@ class HeartbeatManager:
 
                 # 检查超时
                 with self._lock:
-                    if time.time() - self._last_response_time > self.timeout:
+                    current_timeout = self._transfer_timeout if self._transfer_mode else self.timeout
+                    elapsed = time.time() - self._last_response_time
+
+                    if elapsed > current_timeout:
                         if self.on_timeout:
                             self.on_timeout()
                         self.running = False
@@ -276,6 +295,11 @@ class ConnectionMonitor:
             on_timeout=self._on_connection_lost
         )
         self._heartbeat.start()
+
+    def set_transfer_mode(self, enabled: bool):
+        """设置传输模式"""
+        if self._heartbeat:
+            self._heartbeat.set_transfer_mode(enabled)
 
     def _on_connection_lost(self):
         """连接丢失"""
