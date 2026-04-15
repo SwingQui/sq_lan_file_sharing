@@ -39,12 +39,12 @@ def check_system_compatibility():
             elif major == 6 and minor == 1:
                 return (False,
                     "此程序不支持 Windows 7。\n\n"
-                    "原因：程序使用 Python 3.13 编译，需要新版 Windows API。\\\n"
+                    "原因：程序使用 Python 3.13 编译，需要新版 Windows API。\n"
                     "请使用 Windows 10 或 Windows 11 系统。")
             elif major == 6 and minor >= 2:
                 return (False,
                     "此程序不支持 Windows 8/8.1.\n\n"
-                    "原因：程序使用 Python 3.13 编译，需要新版 Windows API.\\n\n"
+                    "原因：程序使用 Python 3.13 编译，需要新版 Windows API.\n"
                     "请使用 Windows 10 或 Windows 11 系统。")
             elif major >= 10:
                 return (True, None)
@@ -82,6 +82,9 @@ def main():
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+
+    from file_handler import FileHandler
+    FileHandler.cleanup_all_temp_files()
 
     # 选择 UI 模式
     # 设置环境变量 SQ_UI=web 使用 Web UI，默认使用 PyQt 原生 UI

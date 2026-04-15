@@ -1,8 +1,6 @@
 """服务器模块"""
 import socket
 import threading
-import random
-import string
 import platform
 from typing import Optional, Callable, Dict
 from pathlib import Path
@@ -50,29 +48,6 @@ class LanShareServer:
         self.on_resume_request: Optional[Callable[[dict], None]] = None
         self.on_data_ack: Optional[Callable[[dict], None]] = None  # 滑动窗口确认
 
-    @staticmethod
-    def get_local_ip() -> str:
-        """获取本机局域网IP地址"""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            return local_ip
-        except Exception:
-            return "127.0.0.1"
-
-    def generate_pair_code(self) -> str:
-        """生成配对码"""
-        local_ip = self.get_local_ip()
-        ip_suffix = local_ip.split('.')[-1]
-
-        chars = string.ascii_uppercase + string.digits
-        random_part = ''.join(random.choice(chars) for _ in range(PAIR_CODE_LENGTH - 2))
-
-        self.pair_code = f"{int(ip_suffix) % 36:02X}"[:2] + random_part
-        return self.pair_code
-
     def start(self) -> bool:
         """启动服务器"""
         try:
@@ -107,13 +82,13 @@ class LanShareServer:
         """处理客户端连接"""
         try:
             client.settimeout(SOCKET_CONFIG['connect_timeout'])
-            header = client.recv(Protocol.HEADER_SIZE)
+            header = Protocol.recv_exactly(client, Protocol.HEADER_SIZE)
             if not header:
                 client.close()
                 return
 
             msg_type, data_len = Protocol.decode_header(header)
-            data = client.recv(data_len) if data_len > 0 else b''
+            data = Protocol.recv_exactly(client, data_len) if data_len > 0 else b''
             msg_data = Protocol.decode_data(data) if data else {}
 
             # 处理重连请求（信任设备）
@@ -149,7 +124,7 @@ class LanShareServer:
             self.device_manager.update_device_seen(device_id, address[0])
 
             # 发送接受消息
-            client.send(MessageBuilder.pair_accept(self.hostname))
+            client.send(MessageBuilder.pair_accept(self.hostname, self.device_manager.device_id))
 
             if self.on_trusted_connect:
                 self.on_trusted_connect(device_id, hostname)
@@ -184,7 +159,7 @@ class LanShareServer:
                     ip=address[0]
                 )
 
-            client.send(MessageBuilder.pair_accept(self.hostname))
+            client.send(MessageBuilder.pair_accept(self.hostname, self.device_manager.device_id))
 
             if self.on_connected:
                 peer_name = msg_data.get('hostname', address[0])
@@ -202,7 +177,8 @@ class LanShareServer:
             sock=self.client_socket,
             interval=HEARTBEAT_INTERVAL,
             timeout=HEARTBEAT_TIMEOUT,
-            on_timeout=self._on_heartbeat_timeout
+            on_timeout=self._on_heartbeat_timeout,
+            send_func=self.send
         )
         self.heartbeat.start()
 
@@ -222,13 +198,17 @@ class LanShareServer:
                 self.client_socket.settimeout(1.0)
                 data = self.client_socket.recv(recv_buffer)
                 if not data:
-                    self._handle_disconnect()
+                    self._handle_disconnect(intentional=False)
                     break
 
                 buffer += data
 
                 while len(buffer) >= Protocol.HEADER_SIZE:
-                    msg_type, data_len = Protocol.decode_header(buffer)
+                    try:
+                        msg_type, data_len = Protocol.decode_header(buffer)
+                    except ValueError:
+                        buffer = b''
+                        break
 
                     if len(buffer) < Protocol.HEADER_SIZE + data_len:
                         break
@@ -243,7 +223,7 @@ class LanShareServer:
             except Exception as e:
                 if self.running and self.on_error:
                     self.on_error(f"接收消息错误: {str(e)}")
-                self._handle_disconnect()
+                self._handle_disconnect(intentional=False)
                 break
 
     def _handle_message(self, msg_type: MessageType, data: bytes):
@@ -295,9 +275,9 @@ class LanShareServer:
                 self.on_error(msg_data.get('error', '未知错误'))
 
         elif msg_type == MessageType.DISCONNECT:
-            self._handle_disconnect()
+            self._handle_disconnect(intentional=True)
 
-    def _handle_disconnect(self, reason: str = ""):
+    def _handle_disconnect(self, reason: str = "", intentional: bool = False):
         """处理断开连接"""
         self.connected = False
 
@@ -313,7 +293,7 @@ class LanShareServer:
             self.client_socket = None
 
         if self.on_disconnected:
-            self.on_disconnected()
+            self.on_disconnected(intentional)
 
     def send(self, data: bytes) -> bool:
         """发送数据"""
@@ -347,14 +327,29 @@ class LanShareServer:
         if self.heartbeat:
             self.heartbeat.set_transfer_mode(enabled)
 
+    def disconnect_client(self):
+        """主动断开客户端连接（发送DISCONNECT消息）"""
+        if self.connected and self.client_socket:
+            try:
+                self.client_socket.send(MessageBuilder.disconnect())
+            except:
+                pass
+
     def stop(self):
         """停止服务器"""
         self.running = False
-        self.connected = False
 
         if self.heartbeat:
             self.heartbeat.stop()
             self.heartbeat = None
+
+        if self.connected and self.client_socket:
+            try:
+                self.client_socket.send(MessageBuilder.disconnect())
+            except:
+                pass
+
+        self.connected = False
 
         if self.client_socket:
             try:

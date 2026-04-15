@@ -137,10 +137,10 @@ class ReconnectManager:
 
             # 等待响应
             from network.protocol import Protocol, MessageType
-            header = sock.recv(Protocol.HEADER_SIZE)
+            header = Protocol.recv_exactly(sock, Protocol.HEADER_SIZE)
             if header:
                 msg_type, data_len = Protocol.decode_header(header)
-                data = sock.recv(data_len) if data_len > 0 else b''
+                data = Protocol.recv_exactly(sock, data_len) if data_len > 0 else b''
 
                 if msg_type == MessageType.PAIR_ACCEPT:
                     # 重连被接受
@@ -169,18 +169,21 @@ class HeartbeatManager:
                  sock: socket.socket,
                  interval: float = HEARTBEAT_INTERVAL,
                  timeout: float = HEARTBEAT_TIMEOUT,
-                 on_timeout: Callable[[], None] = None):
+                 on_timeout: Callable[[], None] = None,
+                 send_func: Optional[Callable[[bytes], bool]] = None):
         """
         Args:
             sock: socket连接
             interval: 心跳间隔
             timeout: 超时时间
             on_timeout: 超时回调
+            send_func: 发送函数（用于线程安全发送），如果提供则优先使用
         """
         self.sock = sock
         self.interval = interval
         self.timeout = timeout
         self.on_timeout = on_timeout
+        self._send_func = send_func
 
         self.running = False
         self._thread: Optional[threading.Thread] = None
@@ -215,8 +218,12 @@ class HeartbeatManager:
         """心跳循环"""
         while self.running:
             try:
-                # 发送心跳
-                self.sock.send(MessageBuilder.heartbeat())
+                # 发送心跳（优先使用 send_func 保证线程安全）
+                heartbeat_data = MessageBuilder.heartbeat()
+                if self._send_func:
+                    self._send_func(heartbeat_data)
+                else:
+                    self.sock.send(heartbeat_data)
 
                 # 检查超时
                 with self._lock:
@@ -250,106 +257,3 @@ class HeartbeatManager:
             self._thread.join(timeout=2)
 
 
-class ConnectionMonitor:
-    """连接监控器 - 综合管理重连和心跳"""
-
-    def __init__(self,
-                 device_id: str,
-                 hostname: str,
-                 port: int = DEFAULT_PORT,
-                 on_disconnected: Callable[[], None] = None,
-                 on_reconnected: Callable[[socket.socket], None] = None,
-                 on_state_changed: Callable[[str], None] = None):
-        """
-        Args:
-            device_id: 本机设备ID
-            hostname: 主机名
-            port: 端口
-            on_disconnected: 断开回调
-            on_reconnected: 重连成功回调
-            on_state_changed: 状态变化回调
-        """
-        self.device_id = device_id
-        self.hostname = hostname
-        self.port = port
-        self.on_disconnected = on_disconnected
-        self.on_reconnected = on_reconnected
-        self.on_state_changed = on_state_changed
-
-        self.current_sock: Optional[socket.socket] = None
-        self.peer_device_id: Optional[str] = None
-        self.peer_ip: Optional[str] = None
-
-        self._heartbeat: Optional[HeartbeatManager] = None
-        self._reconnect: Optional[ReconnectManager] = None
-
-    def start_monitoring(self, sock: socket.socket, peer_device_id: str, peer_ip: str):
-        """开始监控连接"""
-        self.current_sock = sock
-        self.peer_device_id = peer_device_id
-        self.peer_ip = peer_ip
-
-        # 启动心跳
-        self._heartbeat = HeartbeatManager(
-            sock=sock,
-            on_timeout=self._on_connection_lost
-        )
-        self._heartbeat.start()
-
-    def set_transfer_mode(self, enabled: bool):
-        """设置传输模式"""
-        if self._heartbeat:
-            self._heartbeat.set_transfer_mode(enabled)
-
-    def _on_connection_lost(self):
-        """连接丢失"""
-        if self.on_state_changed:
-            self.on_state_changed("连接已断开，正在尝试重连...")
-
-        # 启动重连
-        self._reconnect = ReconnectManager(
-            device_id=self.device_id,
-            hostname=self.hostname,
-            port=self.port,
-            on_reconnected=self._on_reconnected,
-            on_reconnect_failed=self._on_reconnect_failed,
-            on_state_changed=self.on_state_changed
-        )
-        self._reconnect.start_reconnect(self.peer_device_id, self.peer_ip)
-
-    def _on_reconnected(self, sock: socket.socket):
-        """重连成功"""
-        self.current_sock = sock
-
-        # 更新心跳
-        if self._heartbeat:
-            self._heartbeat.stop()
-        self._heartbeat = HeartbeatManager(
-            sock=sock,
-            on_timeout=self._on_connection_lost
-        )
-        self._heartbeat.start()
-
-        if self.on_reconnected:
-            self.on_reconnected(sock)
-
-    def _on_reconnect_failed(self):
-        """重连失败"""
-        if self.on_disconnected:
-            self.on_disconnected()
-
-    def received_heartbeat(self):
-        """收到心跳"""
-        if self._heartbeat:
-            self._heartbeat.received_response()
-
-    def update_peer_ip(self, ip: str):
-        """更新对方IP"""
-        self.peer_ip = ip
-
-    def stop(self):
-        """停止监控"""
-        if self._heartbeat:
-            self._heartbeat.stop()
-        if self._reconnect:
-            self._reconnect.stop()

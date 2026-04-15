@@ -122,6 +122,12 @@ class ChunkedFileReceiver:
             # 记录已接收
             self._received_set.add(chunk_index)
 
+            # 持久化已接收块（支持接收端断点续传）
+            self.state_manager.update_received_chunks(
+                self.current_state.file_hash,
+                [chunk_index]
+            )
+
             # 添加到待确认列表
             self._add_pending_ack(chunk_index)
 
@@ -252,7 +258,13 @@ class ChunkedFileReceiver:
                     counter += 1
 
             # 重命名
-            temp_path.rename(final_path)
+            try:
+                temp_path.rename(final_path)
+            except Exception as rename_err:
+                print(f"重命名失败，尝试复制: {rename_err}")
+                import shutil
+                shutil.copy2(temp_path, final_path)
+                temp_path.unlink(missing_ok=True)
 
             # 清理状态
             self.state_manager.complete_receiving(self.current_state.file_hash)
@@ -268,15 +280,24 @@ class ChunkedFileReceiver:
             return None
 
     def cancel(self):
-        """取消接收"""
-        # 发送最后的确认
+        """取消接收（保留临时文件和状态以便后续续传）"""
         self.flush_acks()
 
         if self.file_handle:
             self.file_handle.close()
             self.file_handle = None
 
-        # 删除临时文件
+        self.current_state = None
+        self._received_set.clear()
+
+    def cleanup(self):
+        """清理临时文件和状态（确认不需要续传时调用）"""
+        self.flush_acks()
+
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
+
         if self.current_state:
             temp_path = self.state_manager.get_temp_file_path(self.current_state.file_hash)
             if temp_path.exists():

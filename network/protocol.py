@@ -15,21 +15,35 @@ class MessageType(IntEnum):
     FILE_ACK = 6          # 文件接收确认
     FILE_ERROR = 7        # 文件传输错误
     DISCONNECT = 8        # 断开连接
-    FILE_LIST_REQUEST = 9 # 文件列表请求
-    FILE_LIST_RESPONSE = 10 # 文件列表响应
-    FILE_ACK_BATCH = 11   # 批量确认
-    FILE_RESUME = 12      # 续传请求
-    FILE_RESUME_OK = 13   # 续传确认
-    FILE_COMPLETE = 14    # 传输完成确认
-    HEARTBEAT = 15        # 心跳包
-    RECONNECT = 16        # 重连请求（信任设备）
-    DATA_ACK = 17         # 数据块确认（滑动窗口用）
+    FILE_ACK_BATCH = 9    # 批量确认
+    FILE_RESUME = 10      # 续传请求
+    FILE_RESUME_OK = 11   # 续传确认
+    FILE_COMPLETE = 12    # 传输完成确认
+    HEARTBEAT = 13        # 心跳包
+    RECONNECT = 14        # 重连请求（信任设备）
+    DATA_ACK = 15         # 数据块确认（滑动窗口用）
 
 
 class Protocol:
     """通信协议处理类"""
 
     HEADER_SIZE = 8  # 4字节类型 + 4字节数据长度
+    MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
+
+    @staticmethod
+    def recv_exactly(sock, n: int) -> Optional[bytes]:
+        """
+        精确接收n个字节（TCP不保证单次recv返回完整数据）
+        Returns:
+            收到的完整bytes，连接关闭返回None
+        """
+        buf = b''
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
 
     @staticmethod
     def encode(message_type: MessageType, data: dict) -> bytes:
@@ -50,6 +64,8 @@ class Protocol:
         if len(header) < Protocol.HEADER_SIZE:
             raise ValueError("Header too short")
         msg_type, data_len = struct.unpack('>II', header[:Protocol.HEADER_SIZE])
+        if data_len > Protocol.MAX_MESSAGE_SIZE:
+            raise ValueError(f"Message too large: {data_len} bytes")
         return MessageType(msg_type), data_len
 
     @staticmethod
@@ -62,19 +78,20 @@ class MessageBuilder:
     """消息构建器"""
 
     @staticmethod
-    def pair_request(pair_code: str, hostname: str) -> bytes:
+    def pair_request(pair_code: str, hostname: str, device_id: str = '') -> bytes:
         """构建配对请求消息"""
-        return Protocol.encode(MessageType.PAIR_REQUEST, {
-            'pair_code': pair_code,
-            'hostname': hostname
-        })
+        msg = {'pair_code': pair_code, 'hostname': hostname}
+        if device_id:
+            msg['device_id'] = device_id
+        return Protocol.encode(MessageType.PAIR_REQUEST, msg)
 
     @staticmethod
-    def pair_accept(hostname: str) -> bytes:
+    def pair_accept(hostname: str, device_id: str = '') -> bytes:
         """构建配对接受消息"""
-        return Protocol.encode(MessageType.PAIR_ACCEPT, {
-            'hostname': hostname
-        })
+        msg = {'hostname': hostname}
+        if device_id:
+            msg['device_id'] = device_id
+        return Protocol.encode(MessageType.PAIR_ACCEPT, msg)
 
     @staticmethod
     def pair_reject(reason: str) -> bytes:
@@ -94,28 +111,32 @@ class MessageBuilder:
         })
 
     @staticmethod
-    def file_data(chunk_index: int, data: bytes) -> bytes:
+    def file_data(chunk_index: int, data: bytes, file_hash: str = '') -> bytes:
         """
         构建文件数据消息
-        格式: [类型4字节][总长度4字节][块序号4字节][数据N字节]
+        格式: [类型4字节][总长度4字节][hash长度2字节][hash N字节][块序号4字节][数据N字节]
         注意：FILE_DATA使用二进制格式，不走JSON
         """
-        total_len = 4 + len(data)  # 块序号4字节 + 数据
+        hash_bytes = file_hash.encode('utf-8') if file_hash else b''
+        total_len = 2 + len(hash_bytes) + 4 + len(data)  # hash_len + hash + chunk_idx + data
         header = struct.pack('>II', MessageType.FILE_DATA, total_len)
+        hash_header = struct.pack('>H', len(hash_bytes))
         chunk_header = struct.pack('>I', chunk_index)
-        return header + chunk_header + data
+        return header + hash_header + hash_bytes + chunk_header + data
 
     @staticmethod
-    def decode_file_data(data: bytes) -> Tuple[int, bytes]:
+    def decode_file_data(data: bytes) -> Tuple[str, int, bytes]:
         """
         解码文件数据消息体
-        返回: (块序号, 实际数据)
+        返回: (文件哈希, 块序号, 实际数据)
         """
-        if len(data) < 4:
+        if len(data) < 6:
             raise ValueError("File data too short")
-        chunk_index = struct.unpack('>I', data[:4])[0]
-        actual_data = data[4:]
-        return chunk_index, actual_data
+        hash_len = struct.unpack('>H', data[:2])[0]
+        file_hash = data[2:2 + hash_len].decode('utf-8') if hash_len > 0 else ''
+        chunk_index = struct.unpack('>I', data[2 + hash_len:6 + hash_len])[0]
+        actual_data = data[6 + hash_len:]
+        return file_hash, chunk_index, actual_data
 
     @staticmethod
     def file_ack(chunk_index: int, success: bool) -> bytes:
@@ -136,18 +157,6 @@ class MessageBuilder:
     def disconnect() -> bytes:
         """构建断开连接消息"""
         return Protocol.encode(MessageType.DISCONNECT, {})
-
-    @staticmethod
-    def file_list_request() -> bytes:
-        """构建文件列表请求消息"""
-        return Protocol.encode(MessageType.FILE_LIST_REQUEST, {})
-
-    @staticmethod
-    def file_list_response(files: list) -> bytes:
-        """构建文件列表响应消息"""
-        return Protocol.encode(MessageType.FILE_LIST_RESPONSE, {
-            'files': files
-        })
 
     @staticmethod
     def file_ack_batch(chunk_indices: list) -> bytes:
@@ -197,15 +206,17 @@ class MessageBuilder:
         })
 
     @staticmethod
-    def data_ack(chunk_index: int) -> bytes:
+    def data_ack(chunk_index: int, file_hash: str = '') -> bytes:
         """构建数据块确认消息（滑动窗口用）"""
-        return Protocol.encode(MessageType.DATA_ACK, {
-            'chunk_index': chunk_index
-        })
+        msg = {'chunk_index': chunk_index}
+        if file_hash:
+            msg['file_hash'] = file_hash
+        return Protocol.encode(MessageType.DATA_ACK, msg)
 
     @staticmethod
-    def data_ack_batch(chunk_indices: list) -> bytes:
+    def data_ack_batch(chunk_indices: list, file_hash: str = '') -> bytes:
         """构建批量数据块确认消息"""
-        return Protocol.encode(MessageType.DATA_ACK, {
-            'chunk_indices': chunk_indices
-        })
+        msg = {'chunk_indices': chunk_indices}
+        if file_hash:
+            msg['file_hash'] = file_hash
+        return Protocol.encode(MessageType.DATA_ACK, msg)

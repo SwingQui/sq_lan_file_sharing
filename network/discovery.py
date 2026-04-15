@@ -6,6 +6,7 @@ import time
 from typing import Optional, Callable, Dict, List
 
 from config import DISCOVERY_PORT, DISCOVERY_TIMEOUT, ROOM_TIMEOUT
+from utils import get_local_ip
 
 
 class DeviceDiscovery:
@@ -52,25 +53,23 @@ class DeviceDiscovery:
         while self.running:
             try:
                 data, addr = self.socket.recvfrom(4096)
-                self._handle_message(data, addr[0])
+                self._handle_message(data, addr)
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.running:
                     print(f"UDP监听错误: {e}")
 
-    def _handle_message(self, data: bytes, sender_ip: str):
+    def _handle_message(self, data: bytes, sender_addr: tuple):
         """处理接收到的消息"""
         try:
             msg = json.loads(data.decode('utf-8'))
             msg_type = msg.get('type')
 
             if msg_type == 'discover':
-                # 收到发现请求，检查是否是找自己的
                 target_device_id = msg.get('target_device_id', '')
                 if target_device_id == self.device_id or not target_device_id:
-                    # 响应
-                    self._send_response(sender_ip)
+                    self._send_response(sender_addr[0], sender_addr[1])
 
             elif msg_type == 'discover_response':
                 # 收到响应
@@ -82,87 +81,23 @@ class DeviceDiscovery:
         except (json.JSONDecodeError, KeyError) as e:
             print(f"解析UDP消息失败: {e}")
 
-    def _send_response(self, target_ip: str):
+    def _send_response(self, target_ip: str, target_port: int):
         """发送响应"""
         try:
             response = {
                 'type': 'discover_response',
                 'device_id': self.device_id,
                 'hostname': self.hostname,
-                'ip': self._get_local_ip()
+                'ip': get_local_ip()
             }
             data = json.dumps(response).encode('utf-8')
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.sendto(data, (target_ip, self.port))
+            sock.sendto(data, (target_ip, target_port))
             sock.close()
         except Exception as e:
             print(f"发送UDP响应失败: {e}")
-
-    def discover_device(self, target_device_id: str, timeout: float = DISCOVERY_TIMEOUT) -> Optional[str]:
-        """
-        发现指定设备
-        Args:
-            target_device_id: 目标设备ID
-            timeout: 超时时间
-        Returns:
-            设备IP，未找到返回None
-        """
-        found_ip = None
-        found_event = threading.Event()
-
-        def on_found(device_id: str, ip: str):
-            nonlocal found_ip
-            if device_id == target_device_id:
-                found_ip = ip
-                found_event.set()
-
-        # 临时设置回调
-        old_callback = self.on_device_found
-        self.on_device_found = on_found
-
-        try:
-            # 广播发现请求
-            self._broadcast_discover(target_device_id)
-
-            # 等待响应
-            found_event.wait(timeout)
-
-            return found_ip
-        finally:
-            self.on_device_found = old_callback
-
-    def _broadcast_discover(self, target_device_id: str):
-        """广播发现请求"""
-        try:
-            msg = {
-                'type': 'discover',
-                'target_device_id': target_device_id,
-                'sender_device_id': self.device_id
-            }
-            data = json.dumps(msg).encode('utf-8')
-
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            # 广播到局域网
-            sock.sendto(data, ('<broadcast>', self.port))
-            sock.close()
-        except Exception as e:
-            print(f"广播发现请求失败: {e}")
-
-    def _get_local_ip(self) -> str:
-        """获取本机IP"""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except:
-            return "127.0.0.1"
 
     def stop(self):
         """停止监听"""
@@ -206,13 +141,13 @@ class DiscoveryClient:
                 print(f"处理UDP响应失败: {e}")
 
         try:
-            # 创建监听socket
+            # 创建监听socket（使用随机端口避免与RoomScanner冲突）
             listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listen_sock.bind(('0.0.0.0', port + 1))  # 使用不同端口监听响应
+            listen_sock.bind(('', 0))  # 随机端口
             listen_sock.settimeout(timeout)
 
-            # 广播发现请求
+            # 广播发现请求到发现端口
             msg = {
                 'type': 'discover',
                 'target_device_id': target_device_id
@@ -309,7 +244,7 @@ class RoomBroadcaster:
                     broadcast_addr = self._get_broadcast_address()
                     msg = {
                         'type': 'room_announce',
-                        'ip': self._get_local_ip(),
+                        'ip': get_local_ip(),
                         'port': self.port,
                         'hostname': self.hostname,
                         'pair_code': self.pair_code
@@ -327,21 +262,10 @@ class RoomBroadcaster:
         finally:
             sock.close()
 
-    def _get_local_ip(self) -> str:
-        """获取本机IP"""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except:
-            return "127.0.0.1"
-
     def _get_broadcast_address(self) -> str:
         """获取子网定向广播地址 (如 192.168.1.255)"""
         try:
-            local_ip = self._get_local_ip()
+            local_ip = get_local_ip()
             parts = local_ip.split('.')
             if len(parts) == 4:
                 return '.'.join(parts[:3]) + '.255'

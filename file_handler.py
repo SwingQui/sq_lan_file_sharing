@@ -4,7 +4,7 @@ import hashlib
 import shutil
 import zipfile
 from pathlib import Path
-from typing import Optional, Callable, Tuple
+from typing import Tuple
 
 from config import BUFFER_SIZE, DEFAULT_DOWNLOAD_DIR, TEMP_DIR
 
@@ -60,10 +60,9 @@ class FileHandler:
 
         elif path.is_dir():
             # 打包文件夹为zip
-            zip_path = TEMP_DIR / f"{path.name}.zip"
-            self._zip_folder(filepath, str(zip_path))
-            filesize = zip_path.stat().st_size
-            file_hash = self.get_file_hash(str(zip_path))
+            zip_path = self.create_temp_zip(filepath)
+            filesize = Path(zip_path).stat().st_size
+            file_hash = self.get_file_hash(zip_path)
             return f"{path.name}.zip", filesize, file_hash, True
 
         else:
@@ -72,7 +71,6 @@ class FileHandler:
     def _zip_folder(self, folder_path: str, zip_path: str):
         """将文件夹打包成zip"""
         folder = Path(folder_path)
-        # 尝试使用 DEFLATED 压缩，如果不可用则使用 STORED
         try:
             compression = zipfile.ZIP_DEFLATED
         except:
@@ -85,11 +83,22 @@ class FileHandler:
                     zipf.write(file, arcname)
 
     def create_temp_zip(self, folder_path: str) -> str:
-        """创建临时zip文件，返回路径"""
+        """创建临时zip文件，返回路径（使用唯一文件名避免冲突）"""
+        import uuid
         folder = Path(folder_path)
-        zip_path = TEMP_DIR / f"{folder.name}.zip"
+        zip_path = TEMP_DIR / f"{folder.name}_{uuid.uuid4().hex[:8]}.zip"
         self._zip_folder(folder_path, str(zip_path))
         return str(zip_path)
+
+    @staticmethod
+    def cleanup_all_temp_files():
+        """清理所有临时文件（启动时调用）"""
+        if TEMP_DIR.exists():
+            for f in TEMP_DIR.iterdir():
+                try:
+                    f.unlink()
+                except:
+                    pass
 
     def cleanup_temp_file(self, filepath: str):
         """清理临时文件"""
@@ -98,123 +107,3 @@ class FileHandler:
         except Exception as e:
             print(f"清理临时文件失败: {e}")
 
-    def save_file(self, filename: str, data: bytes, is_folder: bool = False) -> str:
-        """
-        保存接收到的文件数据
-        Args:
-            filename: 文件名
-            data: 文件数据
-            is_folder: 是否为文件夹（zip格式）
-        Returns:
-            保存后的文件路径
-        """
-        # 获取唯一文件名
-        unique_name = self.get_unique_filename(self.download_dir, filename)
-        filepath = self.download_dir / unique_name
-
-        # 写入文件
-        with open(filepath, 'wb') as f:
-            f.write(data)
-
-        # 如果是文件夹，解压
-        if is_folder and filename.endswith('.zip'):
-            folder_name = filename[:-4]  # 去掉.zip
-            unique_folder = self.get_unique_filename(self.download_dir, folder_name)
-            extract_path = self.download_dir / unique_folder
-
-            try:
-                with zipfile.ZipFile(filepath, 'r') as zipf:
-                    zipf.extractall(extract_path)
-                # 删除临时zip文件
-                filepath.unlink()
-                return str(extract_path)
-            except Exception as e:
-                print(f"解压文件夹失败: {e}")
-                return str(filepath)
-
-        return str(filepath)
-
-
-class FileSender:
-    """文件发送器"""
-
-    def __init__(self, file_handler: FileHandler):
-        self.file_handler = file_handler
-        self.current_file: Optional[str] = None
-        self.current_file_handle = None
-        self.current_index = 0
-        self.total_chunks = 0
-        self.is_folder = False
-        self.temp_zip_path: Optional[str] = None
-
-        # 回调
-        self.on_progress: Optional[Callable[[int, int], None]] = None
-        self.on_complete: Optional[Callable[[], None]] = None
-        self.on_error: Optional[Callable[[str], None]] = None
-
-    def prepare(self, filepath: str) -> Tuple[str, int, str, bool]:
-        """
-        准备发送文件
-        Returns:
-            (文件名, 大小, 哈希, 是否为文件夹)
-        """
-        path = Path(filepath)
-
-        if path.is_dir():
-            self.is_folder = True
-            self.temp_zip_path = self.file_handler.create_temp_zip(filepath)
-            self.current_file = self.temp_zip_path
-        else:
-            self.is_folder = False
-            self.current_file = filepath
-
-        filesize = Path(self.current_file).stat().st_size
-        self.total_chunks = (filesize + BUFFER_SIZE - 1) // BUFFER_SIZE
-        file_hash = FileHandler.get_file_hash(self.current_file)
-        filename = Path(filepath).name + ('.zip' if self.is_folder else '')
-
-        return filename, filesize, file_hash, self.is_folder
-
-    def get_next_chunk(self) -> Optional[bytes]:
-        """获取下一个数据块"""
-        if not self.current_file:
-            return None
-
-        if self.current_file_handle is None:
-            self.current_file_handle = open(self.current_file, 'rb')
-
-        data = self.current_file_handle.read(BUFFER_SIZE)
-        if not data:
-            return None
-
-        chunk_index = self.current_index
-        self.current_index += 1
-
-        if self.on_progress:
-            self.on_progress(self.current_index, self.total_chunks)
-
-        # 使用简单的二进制格式传输数据块
-        return chunk_index.to_bytes(4, 'big') + data
-
-    def complete(self):
-        """发送完成，清理资源"""
-        if self.current_file_handle:
-            try:
-                self.current_file_handle.close()
-            except:
-                pass
-            self.current_file_handle = None
-
-        if self.temp_zip_path:
-            self.file_handler.cleanup_temp_file(self.temp_zip_path)
-            self.temp_zip_path = None
-
-        self.current_file = None
-        self.current_index = 0
-
-        if self.on_complete:
-            self.on_complete()
-
-    def cancel(self):
-        """取消发送"""
-        self.complete()

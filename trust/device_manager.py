@@ -1,5 +1,6 @@
 """设备标识与信任管理模块"""
 import json
+import threading
 import uuid
 import platform
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
 from config import LAN_SHARE_DIR
+from utils import atomic_write_json
 
 
 class DeviceManager:
@@ -21,6 +23,10 @@ class DeviceManager:
 
         self.device_id: str = self._load_or_create_device_id()
         self.hostname = platform.node()
+
+        # 内存缓存
+        self._devices_cache: Optional[Dict] = None
+        self._cache_lock = threading.Lock()
 
     def _load_or_create_device_id(self) -> str:
         """加载或创建设备标识"""
@@ -38,39 +44,35 @@ class DeviceManager:
         device_id = f"{platform.node()}-{username}-{unique_id}"
 
         # 持久化
-        self._atomic_write_json(self.device_id_file, {
+        atomic_write_json(self.device_id_file, {
             'device_id': device_id,
             'created_at': datetime.now().isoformat()
         })
 
         return device_id
 
-    def _atomic_write_json(self, filepath: Path, data: dict):
-        """原子写入 JSON 文件"""
-        temp_file = filepath.with_suffix('.tmp')
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            # 原子重命名
-            temp_file.replace(filepath)
-        except Exception:
-            if temp_file.exists():
-                temp_file.unlink()
-            raise
-
     def _load_trusted_devices(self) -> dict:
-        """加载信任设备列表"""
+        """加载信任设备列表（优先从缓存读取）"""
+        with self._cache_lock:
+            if self._devices_cache is not None:
+                return self._devices_cache
+
         if self.trusted_devices_file.exists():
             try:
                 with open(self.trusted_devices_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    with self._cache_lock:
+                        self._devices_cache = data
+                    return data
             except (json.JSONDecodeError, IOError):
                 pass
         return {'devices': []}
 
     def _save_trusted_devices(self, data: dict):
-        """保存信任设备列表"""
-        self._atomic_write_json(self.trusted_devices_file, data)
+        """保存信任设备列表并更新缓存"""
+        atomic_write_json(self.trusted_devices_file, data)
+        with self._cache_lock:
+            self._devices_cache = data
 
     def is_trusted(self, device_id: str) -> bool:
         """检查设备是否在信任列表中"""
@@ -163,3 +165,8 @@ class DeviceManager:
             if device.get('last_ip') == ip:
                 return device
         return None
+
+    def reload(self):
+        """强制重新从磁盘加载信任设备列表"""
+        with self._cache_lock:
+            self._devices_cache = None

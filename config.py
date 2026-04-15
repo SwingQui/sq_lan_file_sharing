@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from utils import atomic_write_json
+
 
 def get_base_dir() -> Path:
     """获取基础目录（exe所在目录或脚本目录）"""
@@ -237,14 +239,7 @@ def load_user_config() -> dict:
 
 def save_user_config(config: dict):
     """保存用户配置"""
-    temp_file = USER_CONFIG_FILE.with_suffix('.tmp')
-    try:
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        temp_file.replace(USER_CONFIG_FILE)
-    except Exception:
-        if temp_file.exists():
-            temp_file.unlink()
+    atomic_write_json(USER_CONFIG_FILE, config)
 
 
 def get_last_file_dir() -> str:

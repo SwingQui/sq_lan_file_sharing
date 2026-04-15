@@ -1,13 +1,14 @@
 """传输状态持久化模块 - 优化版（内存缓存）"""
-import json
 import time
 import threading
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Set, List, Dict
 from dataclasses import dataclass, field, asdict
 
 from config import LAN_SHARE_DIR, CHUNK_SIZE
+from utils import atomic_write_json
 
 
 @dataclass
@@ -70,26 +71,11 @@ class TransferStateManager:
         # ===== 内存缓存（关键优化）=====
         self._sending_cache: Dict[str, SendingState] = {}
         self._receiving_cache: Dict[str, ReceivingState] = {}
-        self._cache_lock = threading.Lock()
+        self._cache_lock = threading.RLock()
 
         # 同步控制
         self._last_sync_time: float = 0
         self._chunks_since_sync: int = 0
-
-    def _atomic_write_json(self, filepath: Path, data: dict):
-        """原子写入 JSON 文件"""
-        temp_file = filepath.with_suffix('.tmp')
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            temp_file.replace(filepath)
-        except Exception as e:
-            if temp_file.exists():
-                try:
-                    temp_file.unlink()
-                except:
-                    pass
-            raise e
 
     def _read_json(self, filepath: Path) -> Optional[dict]:
         """读取 JSON 文件"""
@@ -122,7 +108,7 @@ class TransferStateManager:
         """保存发送状态到磁盘"""
         state.updated_at = datetime.now().isoformat()
         filepath = self.sending_dir / f"{state.file_hash}.json"
-        self._atomic_write_json(filepath, asdict(state))
+        atomic_write_json(filepath, asdict(state))
 
     def load_sending_state(self, file_hash: str) -> Optional[SendingState]:
         """加载发送状态（优先从缓存读取）"""
@@ -217,7 +203,7 @@ class TransferStateManager:
         """保存接收状态到磁盘"""
         state.updated_at = datetime.now().isoformat()
         filepath = self.receiving_dir / f"{state.file_hash}.json"
-        self._atomic_write_json(filepath, asdict(state))
+        atomic_write_json(filepath, asdict(state))
 
     def load_receiving_state(self, file_hash: str) -> Optional[ReceivingState]:
         """加载接收状态（优先从缓存读取）"""
